@@ -34,7 +34,8 @@ pub fn detect(
     let b_dur = baseline.metadata.end_time.saturating_sub(baseline.metadata.start_time);
     let t_dur = test.metadata.end_time.saturating_sub(test.metadata.start_time);
     let tol = config.duration_tolerance as f64;
-    if b_dur > 0 && t_dur > 0 {
+    // tol == 0.0 disables the temporal check entirely.
+    if tol > 0.0 && b_dur > 0 && t_dur > 0 {
         let ratio = b_dur as f64 / t_dur as f64;
         if ratio < (1.0 - tol) || ratio > (1.0 + tol) {
             return Err(DetectError::TemporalMismatch {

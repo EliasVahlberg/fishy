@@ -28,6 +28,10 @@ struct Cli {
     /// Output full AnomalyReport as JSON
     #[arg(long)]
     json: bool,
+
+    /// Duration tolerance for temporal validation, 0.0 = disabled [default: 0.5]
+    #[arg(long, default_value = "0.5")]
+    duration_tolerance: f32,
 }
 
 fn main() {
@@ -50,6 +54,7 @@ fn main() {
     let config = DetectConfig {
         mode,
         significance_threshold: cli.threshold,
+        duration_tolerance: cli.duration_tolerance,
         ..DetectConfig::default()
     };
 

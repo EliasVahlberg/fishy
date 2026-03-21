@@ -90,6 +90,7 @@ fn parse_format(s: &str) -> LogFormat {
     match s {
         "nginx" => LogFormat::NginxAccess,
         "syslog" => LogFormat::Syslog,
+        "bgl" => LogFormat::Bgl,
         s if s.starts_with("json:") => {
             let parts: Vec<&str> = s[5..].splitn(2, ',').collect();
             LogFormat::Json {

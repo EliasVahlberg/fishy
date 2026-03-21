@@ -12,6 +12,9 @@ pub enum LogFormat {
     Json { message_field: String, timestamp_field: String },
     /// User-supplied regex with named captures `(?P<timestamp>...)` and `(?P<message>...)`.
     Custom { pattern: String },
+    /// Blue Gene/L supercomputer log (LogHub BGL dataset).
+    /// Format: LABEL UNIX_TS DATE NODE FULL_TS NODE COMPONENT SUBSYSTEM SEVERITY MESSAGE
+    Bgl,
 }
 
 /// A single log file to be encoded.
@@ -28,7 +31,10 @@ pub fn parse_timestamp(ts: &str, format: &LogFormat) -> Option<u64> {
     match format {
         LogFormat::NginxAccess => parse_nginx_ts(ts),
         LogFormat::Syslog => parse_syslog_ts(ts),
-        LogFormat::Json { .. } | LogFormat::Custom { .. } => ts.parse::<u64>().ok(),
+        // BGL, Json, Custom all carry Unix seconds as the timestamp string.
+        LogFormat::Bgl | LogFormat::Json { .. } | LogFormat::Custom { .. } => {
+            ts.parse::<u64>().ok()
+        }
     }
 }
 

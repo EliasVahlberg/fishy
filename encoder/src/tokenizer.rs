@@ -19,6 +19,7 @@ pub fn extract_template_and_ts(line: &str, format: &LogFormat) -> Option<(String
             parse_json_line(line, message_field, timestamp_field)
         }
         LogFormat::Custom { pattern } => parse_custom(line, pattern),
+        LogFormat::Bgl => parse_bgl(line),
     }
 }
 
@@ -66,6 +67,23 @@ fn parse_custom(line: &str, pattern: &str) -> Option<(String, Option<String>)> {
     let ts = caps.name("timestamp").map(|m| m.as_str().to_string());
     let msg = caps.name("message")?.as_str();
     Some((normalise_message(msg), ts))
+}
+
+/// BGL: `LABEL UNIX_TS DATE NODE FULL_TS NODE COMPONENT SUBSYSTEM SEVERITY MESSAGE`
+fn parse_bgl(line: &str) -> Option<(String, Option<String>)> {
+    let mut parts = line.splitn(10, char::is_whitespace).filter(|s| !s.is_empty());
+    let _label     = parts.next()?;
+    let unix_ts    = parts.next()?;
+    let _date      = parts.next()?;
+    let _node      = parts.next()?;
+    let _full_ts   = parts.next()?;
+    let _node2     = parts.next()?;
+    let component  = parts.next()?;
+    let subsystem  = parts.next()?;
+    let severity   = parts.next()?;
+    let message    = parts.next().unwrap_or("");
+    let template = format!("{component} {subsystem} {severity}: {}", normalise_message(message));
+    Some((template, Some(unix_ts.to_string())))
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,29 @@
+{
+  "map": {
+    "RAS KERNEL INFO: <v> floating point alignment exceptions": 3,
+    "RAS KERNEL INFO: generating core.<v>": 1,
+    "RAS KERNEL INFO: CE sym <v>, at 0x17086be0, mask 0x02": 11,
+    "RAS KERNEL INFO: CE sym <v>, at 0x07a95e80, mask 0x10": 9,
+    "RAS KERNEL FATAL: force load<v> alignment...............<v>": 8,
+    "RAS KERNEL INFO: CE sym <v>, at 0x0d09f1c0, mask 0x80": 5,
+    "RAS KERNEL INFO: <v> double-hummer alignment exceptions": 2,
+    "RAS KERNEL INFO: ciod: generated <v> core files for program <v>": 4,
+    "RAS KERNEL INFO: CE sym <v>, at 0x180462c0, mask 0x02": 6,
+    "RAS KERNEL INFO: <v> L3 EDRAM error(s) (dcr 0x0157) detected and corrected over <v> seconds": 10,
+    "RAS KERNEL INFO: CE sym <v>, at 0x1438f9e0, mask 0x40": 7
+  },
+  "templates": [
+    "<unknown>",
+    "RAS KERNEL INFO: generating core.<v>",
+    "RAS KERNEL INFO: <v> double-hummer alignment exceptions",
+    "RAS KERNEL INFO: <v> floating point alignment exceptions",
+    "RAS KERNEL INFO: ciod: generated <v> core files for program <v>",
+    "RAS KERNEL INFO: CE sym <v>, at 0x0d09f1c0, mask 0x80",
+    "RAS KERNEL INFO: CE sym <v>, at 0x180462c0, mask 0x02",
+    "RAS KERNEL INFO: CE sym <v>, at 0x1438f9e0, mask 0x40",
+    "RAS KERNEL FATAL: force load<v> alignment...............<v>",
+    "RAS KERNEL INFO: CE sym <v>, at 0x07a95e80, mask 0x10",
+    "RAS KERNEL INFO: <v> L3 EDRAM error(s) (dcr 0x0157) detected and corrected over <v> seconds",
+    "RAS KERNEL INFO: CE sym <v>, at 0x17086be0, mask 0x02"
+  ]
+}
