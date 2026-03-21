@@ -5,16 +5,9 @@
 //! # Workflow
 //!
 //! ```text
-//! # 1. Build a template dictionary from baseline logs
 //! encoder build-dict logs/baseline/ -o dict.json
-//!
-//! # 2. Encode baseline → fishy format (using the dictionary)
 //! encoder encode logs/baseline/ --dict dict.json -o collections/baseline/
-//!
-//! # 3. Encode test using the SAME dictionary (shared template IDs)
-//! encoder encode logs/test/ --dict dict.json -o collections/test/
-//!
-//! # 4. Run fishy
+//! encoder encode logs/test/     --dict dict.json -o collections/test/
 //! fishy -b collections/baseline/ -c collections/test/
 //! ```
 
@@ -29,43 +22,59 @@ use analysis::SourceId;
 use fishy::{CollectionMetadata, Event, EventStream, LogCollection};
 use std::collections::HashMap;
 
-/// Build a `Dictionary` by scanning all log lines in `inputs`.
-/// Must be called on the baseline before encoding either collection.
+/// Build a frequency-ranked `Dictionary` by scanning all log lines in `inputs`.
+///
+/// Template IDs are assigned by descending frequency: the most common template
+/// gets `TemplateId(1)`, the next `TemplateId(2)`, and so on. This mirrors the
+/// core idea of Huffman coding — frequent symbols get the smallest codes.
 pub fn build_dictionary(inputs: &[LogInput]) -> Dictionary {
-    let mut dict = Dictionary::new();
+    let mut freqs: HashMap<String, u64> = HashMap::new();
     for input in inputs {
-        if let Ok(lines) = std::fs::read_to_string(&input.path) {
-            for line in lines.lines() {
-                if let Some(template) = tokenizer::extract_template(line, &input.format) {
-                    dict.intern(template);
+        if let Ok(content) = std::fs::read_to_string(&input.path) {
+            for line in content.lines() {
+                if let Some((template, _)) =
+                    tokenizer::extract_template_and_ts(line, &input.format)
+                {
+                    *freqs.entry(template).or_insert(0) += 1;
                 }
             }
         }
     }
-    dict
+    Dictionary::from_frequencies(freqs.into_iter().collect())
 }
 
 /// Encode a set of log files into a `LogCollection` using an existing `Dictionary`.
-/// Lines whose templates are not in the dictionary are assigned `TemplateId(0)` (unknown).
+///
+/// Timestamps are **sticky**: a timestamp seen on one line applies to all subsequent
+/// lines (within the same source file) until a new timestamp appears. This matches
+/// log formats where a timestamp header precedes a block of events.
+///
+/// Lines whose templates are not in the dictionary are assigned `TemplateId(0)`.
 pub fn encode(inputs: &[LogInput], dict: &Dictionary) -> LogCollection {
     let mut sources: HashMap<SourceId, EventStream> = HashMap::new();
     let mut global_min_ts: Option<u64> = None;
     let mut global_max_ts: Option<u64> = None;
 
-    // First pass: collect all (source, template_id, timestamp) triples.
+    // First pass: collect (source_id, template_id, absolute_ts) with sticky timestamps.
     let mut raw: Vec<(SourceId, analysis::TemplateId, u64)> = Vec::new();
     for input in inputs {
         let Ok(content) = std::fs::read_to_string(&input.path) else { continue };
+        let mut last_ts: Option<u64> = None;
         for line in content.lines() {
-            let Some((template, ts)) = tokenizer::extract_template_and_ts(line, &input.format)
+            let Some((template, ts_str)) =
+                tokenizer::extract_template_and_ts(line, &input.format)
             else {
                 continue;
             };
-            let tid = dict.lookup(&template);
-            let ts_secs = parser::parse_timestamp(&ts, &input.format).unwrap_or(0);
-            global_min_ts = Some(global_min_ts.map_or(ts_secs, |m: u64| m.min(ts_secs)));
-            global_max_ts = Some(global_max_ts.map_or(ts_secs, |m: u64| m.max(ts_secs)));
-            raw.push((input.source_id, tid, ts_secs));
+            // Update sticky timestamp when this line carries one.
+            if let Some(ts_str) = ts_str {
+                if let Some(ts) = parser::parse_timestamp(&ts_str, &input.format) {
+                    last_ts = Some(ts);
+                    global_min_ts = Some(global_min_ts.map_or(ts, |m: u64| m.min(ts)));
+                    global_max_ts = Some(global_max_ts.map_or(ts, |m: u64| m.max(ts)));
+                }
+            }
+            raw.push((input.source_id, dict.lookup(&template), last_ts.unwrap_or(0)));
         }
     }
 

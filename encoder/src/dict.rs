@@ -3,32 +3,31 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Maps template strings ↔ stable `TemplateId` integers.
+/// Maps template strings ↔ frequency-ranked `TemplateId` integers.
 ///
-/// `TemplateId(0)` is reserved for unknown patterns (lines not seen during `build_dictionary`).
+/// IDs are assigned by descending frequency: most common template → `TemplateId(1)`.
+/// `TemplateId(0)` is reserved for unknown patterns (not seen during `build_dictionary`).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Dictionary {
-    /// template string → id
     map: HashMap<String, u32>,
-    /// id → template string (for human-readable output)
-    templates: Vec<String>,
+    templates: Vec<String>, // index = id; [0] = "<unknown>"
 }
 
 impl Dictionary {
-    pub fn new() -> Self {
-        // Reserve id 0 for unknown.
+    fn empty() -> Self {
         Self { map: HashMap::new(), templates: vec!["<unknown>".into()] }
     }
 
-    /// Intern a template string, returning its `TemplateId`. Idempotent.
-    pub fn intern(&mut self, template: String) -> TemplateId {
-        if let Some(&id) = self.map.get(&template) {
-            return TemplateId(id);
+    /// Build a frequency-ranked dictionary from `(template, count)` pairs.
+    pub fn from_frequencies(mut freqs: Vec<(String, u64)>) -> Self {
+        freqs.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        let mut d = Self::empty();
+        for (template, _) in freqs {
+            let id = d.templates.len() as u32;
+            d.map.insert(template.clone(), id);
+            d.templates.push(template);
         }
-        let id = self.templates.len() as u32;
-        self.map.insert(template.clone(), id);
-        self.templates.push(template);
-        TemplateId(id)
+        d
     }
 
     /// Look up a template string. Returns `TemplateId(0)` if not found.
@@ -47,6 +46,6 @@ impl Dictionary {
     }
 
     pub fn len(&self) -> usize {
-        self.templates.len() - 1 // exclude the reserved unknown slot
+        self.templates.len() - 1
     }
 }
