@@ -1,0 +1,24 @@
+[package]
+name = "fishy"
+version = "0.1.0"
+edition = "2021"
+description = "Multi-source information-fusion anomaly detection through collection comparison"
+
+[[bin]]
+name = "fishy"
+path = "src/main.rs"
+
+[[bin]]
+name = "gen"
+path = "src/bin/gen.rs"
+
+[dependencies]
+analysis = { path = "../analysis" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = { version = "1", optional = true }
+
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon"]

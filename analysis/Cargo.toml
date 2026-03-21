@@ -1,0 +1,8 @@
+[package]
+name = "analysis"
+version = "0.1.0"
+edition = "2021"
+description = "Stateless analysis functions for information-fusion anomaly detection"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
