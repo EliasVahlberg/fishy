@@ -348,6 +348,7 @@ struct Stability {
 }
 
 /// Split baseline into two halves, run each method on both halves, return variance proxy.
+#[cfg(not(feature = "parallel"))]
 fn baseline_stability(baseline: &LogCollection, pairs: &[SourceId]) -> Stability {
     if pairs.is_empty() {
         return Stability { dist: 0.0, dep: 0.0, spec: 0.0, co: 0.0, conflict: 0.0 };
