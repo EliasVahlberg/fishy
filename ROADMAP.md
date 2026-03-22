@@ -77,17 +77,17 @@ After this milestone: fishy is the actual product.
   - day_1 vs day_3 (normal↔attack) → 1.00 ✅
 - [x] Document results (`results/ait_russellmitchell.md`)
 
-## Milestone 9 — Drain Encoder
+## Milestone 9 — Drain Encoder ✅
 > Replace format-specific regex parsers with a format-agnostic Drain parse tree.
 > Consistency guarantee: tree built from baseline, serialised, reused for test collection.
-> Motivation informed by M8 results — do after seeing real template quality issues.
 
-- [ ] Drain parse tree — fixed depth (3–4), token similarity threshold ~0.5, digit-containing tokens route to wildcard
-- [ ] `MaxChild` branching limit to prevent tree explosion
-- [ ] Single code path replaces all `LogFormat` variants
-- [ ] Serialise trained tree alongside dictionary (`drain.json` next to `dict.json`)
-- [ ] `build-dict` updated to build Drain tree in first pass, dictionary in second
-- [ ] `encode` updated to load and apply serialised Drain tree
+- [x] Drain parse tree — fixed depth, similarity threshold 0.5, digit-containing tokens → wildcard
+- [x] `MaxChild` branching limit to prevent tree explosion (default 100)
+- [x] Single code path replaces all `LogFormat` variants — no `-f` flag needed
+- [x] Generic timestamp auto-detection (ISO 8601, syslog, nginx/apache, unix seconds, JSON)
+- [x] Serialise trained tree alongside dictionary (`drain.json` next to `dict.json`)
+- [x] `build-dict` builds Drain tree in first pass, dictionary in second
+- [x] `encode` loads and applies serialised Drain tree
 
 ## Milestone 10 — Score Calibration ✅
 > Validate that the scores mean something beyond the AIT-LDSv2 evaluation.

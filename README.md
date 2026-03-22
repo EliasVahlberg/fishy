@@ -14,13 +14,13 @@ Point it at a known-good baseline and a suspect collection. It'll tell you if th
 Raw logs need tokenizing first:
 
 ```
-$ encoder build-dict -f nginx baseline_logs/ -o dict.json
-$ encoder encode -f nginx -d dict.json baseline_logs/ -o baseline/
-$ encoder encode -f nginx -d dict.json test_logs/ -o test/
+$ encoder build-dict baseline_logs/ -o dict.json
+$ encoder encode baseline_logs/ -d dict.json -o baseline/
+$ encoder encode test_logs/ -d dict.json -o test/
 $ fishy -b baseline/ -c test/ -v
 ```
 
-Supported log formats: nginx, syslog, JSON, BGL, custom regex.
+The encoder uses a Drain parse tree for format-agnostic template extraction — no format flag needed. Timestamps are auto-detected (syslog, nginx, apache, ISO 8601, JSON, Unix seconds).
 
 Already have JSON collections? Skip the encoder and point fishy at the directories directly.
 

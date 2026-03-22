@@ -1,110 +1,159 @@
 use analysis::SourceId;
+use regex::Regex;
 use std::path::PathBuf;
-
-/// Supported log formats.
-#[derive(Clone, Debug)]
-pub enum LogFormat {
-    /// nginx/Apache combined access log (Combined Log Format).
-    NginxAccess,
-    /// Apache Combined Log Format — identical parser to NginxAccess.
-    ApacheAccess,
-    /// Apache 2.4 error log: `[Day Mon DD HH:MM:SS.usec YYYY] [level] [pid N] message`
-    ApacheError,
-    /// RFC 3164 / RFC 5424 syslog.
-    Syslog,
-    /// One JSON object per line; specify the message field name (dotted paths supported).
-    Json { message_field: String, timestamp_field: String },
-    /// User-supplied regex with named captures `(?P<timestamp>...)` and `(?P<message>...)`.
-    Custom { pattern: String },
-    /// Blue Gene/L supercomputer log (LogHub BGL dataset).
-    /// Format: LABEL UNIX_TS DATE NODE FULL_TS NODE COMPONENT SUBSYSTEM SEVERITY MESSAGE
-    Bgl,
-}
+use std::sync::OnceLock;
 
 /// A single log source, potentially spanning multiple rotated files.
 #[derive(Clone, Debug)]
 pub struct LogInput {
     pub source_id: SourceId,
     pub paths: Vec<PathBuf>,
-    pub format: LogFormat,
 }
 
-/// Parse a timestamp string into Unix seconds.
-/// Returns `None` if parsing fails — the event is still included with ts=0.
-pub fn parse_timestamp(ts: &str, format: &LogFormat) -> Option<u64> {
-    match format {
-        LogFormat::NginxAccess | LogFormat::ApacheAccess => parse_nginx_ts(ts),
-        LogFormat::ApacheError => parse_apache_error_ts(ts),
-        LogFormat::Syslog => parse_syslog_ts(ts),
-        // BGL, Json, Custom all carry Unix seconds as the timestamp string.
-        LogFormat::Bgl | LogFormat::Json { .. } | LogFormat::Custom { .. } => {
-            ts.parse::<u64>().ok()
+/// Try to extract a Unix-seconds timestamp from the beginning of a line.
+/// Tries common patterns in order: ISO 8601, syslog, nginx/apache access,
+/// apache error, unix seconds. Returns (timestamp_unix_secs, rest_of_line).
+pub fn extract_timestamp(line: &str) -> (Option<u64>, &str) {
+    // JSON lines — try timestamp field
+    if line.starts_with('{') {
+        return extract_json_ts(line);
+    }
+
+    // Try each pattern against the line start
+    for extractor in EXTRACTORS.iter() {
+        if let Some((ts, rest)) = extractor(line) {
+            return (Some(ts), rest);
         }
     }
+
+    (None, line)
+}
+
+type TsExtractor = fn(&str) -> Option<(u64, &str)>;
+
+const EXTRACTORS: &[TsExtractor] = &[
+    extract_iso8601,
+    extract_syslog_ts,
+    extract_nginx_ts,
+    extract_apache_error_ts,
+    extract_unix_seconds,
+];
+
+/// ISO 8601: `2022-01-21T03:01:00+01:00` or `2022-01-21 03:01:00`
+fn extract_iso8601(line: &str) -> Option<(u64, &str)> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})(?:\.\d+)?(?:[+-]\d{2}:?\d{2}|Z)?\s*").unwrap()
+    });
+    let caps = re.captures(line)?;
+    let ts_str = &caps[1];
+    let rest = &line[caps[0].len()..];
+    // Parse: YYYY-MM-DDxHH:MM:SS
+    let y: u64 = ts_str[0..4].parse().ok()?;
+    let m: u64 = ts_str[5..7].parse().ok()?;
+    let d: u64 = ts_str[8..10].parse().ok()?;
+    let h: u64 = ts_str[11..13].parse().ok()?;
+    let min: u64 = ts_str[14..16].parse().ok()?;
+    let s: u64 = ts_str[17..19].parse().ok()?;
+    let days = days_from_ymd(y, m, d)?;
+    Some((days * 86400 + h * 3600 + min * 60 + s, rest))
+}
+
+/// Syslog: `Jan 10 13:55:36 hostname ...`
+fn extract_syslog_ts(line: &str) -> Option<(u64, &str)> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"^(\w{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+").unwrap()
+    });
+    let caps = re.captures(line)?;
+    let month = month_num(&caps[1])?;
+    let day: u64 = caps[2].parse().ok()?;
+    let h: u64 = caps[3].parse().ok()?;
+    let min: u64 = caps[4].parse().ok()?;
+    let s: u64 = caps[5].parse().ok()?;
+    let year = 2025u64;
+    let days = days_from_ymd(year, month, day)?;
+    let rest = &line[caps[0].len()..];
+    Some((days * 86400 + h * 3600 + min * 60 + s, rest))
+}
+
+/// nginx/apache access: `... [10/Oct/2000:13:55:36 -0700] ...`
+/// We look for the bracketed timestamp anywhere in the line.
+fn extract_nginx_ts(line: &str) -> Option<(u64, &str)> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"\[(\d{2})/(\w{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2})\s+[^\]]*\]").unwrap()
+    });
+    let caps = re.captures(line)?;
+    let day: u64 = caps[1].parse().ok()?;
+    let month = month_num(&caps[2])?;
+    let year: u64 = caps[3].parse().ok()?;
+    let h: u64 = caps[4].parse().ok()?;
+    let min: u64 = caps[5].parse().ok()?;
+    let s: u64 = caps[6].parse().ok()?;
+    let days = days_from_ymd(year, month, day)?;
+    Some((days * 86400 + h * 3600 + min * 60 + s, line))
+}
+
+/// Apache error: `[Wed Oct 11 14:32:52.123456 2000] ...`
+fn extract_apache_error_ts(line: &str) -> Option<(u64, &str)> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"^\[\w+ (\w+)\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?\s+(\d{4})\]\s*").unwrap()
+    });
+    let caps = re.captures(line)?;
+    let month = month_num(&caps[1])?;
+    let day: u64 = caps[2].parse().ok()?;
+    let h: u64 = caps[3].parse().ok()?;
+    let min: u64 = caps[4].parse().ok()?;
+    let s: u64 = caps[5].parse().ok()?;
+    let year: u64 = caps[6].parse().ok()?;
+    let days = days_from_ymd(year, month, day)?;
+    let rest = &line[caps[0].len()..];
+    Some((days * 86400 + h * 3600 + min * 60 + s, rest))
+}
+
+/// Bare unix seconds at start of line (e.g. BGL: `- 1117838570 ...`)
+fn extract_unix_seconds(line: &str) -> Option<(u64, &str)> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"^(?:\S+\s+)?(\d{9,10})\s+").unwrap()
+    });
+    let caps = re.captures(line)?;
+    let ts: u64 = caps[1].parse().ok()?;
+    // Sanity: must be a plausible Unix timestamp (2001-2030)
+    if ts < 978_307_200 || ts > 1_893_456_000 { return None; }
+    let rest = &line[caps[0].len()..];
+    Some((ts, rest))
+}
+
+/// JSON: try common timestamp fields
+fn extract_json_ts(line: &str) -> (Option<u64>, &str) {
+    let v: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return (None, line),
+    };
+    for field in &["timestamp", "@timestamp", "time", "ts", "datetime"] {
+        if let Some(val) = v.get(field) {
+            if let Some(n) = val.as_u64() {
+                return (Some(n), line);
+            }
+            if let Some(s) = val.as_str() {
+                if let Some((ts, _)) = extract_iso8601(s) {
+                    return (Some(ts), line);
+                }
+                if let Ok(n) = s.parse::<u64>() {
+                    return (Some(n), line);
+                }
+            }
+        }
+    }
+    (None, line)
 }
 
 // ---------------------------------------------------------------------------
-// Timestamp parsers
+// Calendar helpers
 // ---------------------------------------------------------------------------
-
-/// nginx: `10/Oct/2000:13:55:36 -0700`
-fn parse_nginx_ts(ts: &str) -> Option<u64> {
-    // Minimal: parse day/month/year hour:min:sec, ignore timezone.
-    let parts: Vec<&str> = ts.splitn(2, ':').collect();
-    if parts.len() < 2 { return None; }
-    let date_part = parts[0]; // "10/Oct/2000"
-    let time_part = parts[1]; // "13:55:36 -0700"
-
-    let dp: Vec<&str> = date_part.split('/').collect();
-    if dp.len() != 3 { return None; }
-    let day: u64 = dp[0].parse().ok()?;
-    let month = month_num(dp[1])?;
-    let year: u64 = dp[2].parse().ok()?;
-
-    let tp: Vec<&str> = time_part.split_whitespace().next()?.split(':').collect();
-    if tp.len() < 3 { return None; }
-    let h: u64 = tp[0].parse().ok()?;
-    let m: u64 = tp[1].parse().ok()?;
-    let s: u64 = tp[2].parse().ok()?;
-
-    // Rough Unix seconds (ignores leap seconds and timezone).
-    let days_since_epoch = days_from_ymd(year, month, day)?;
-    Some(days_since_epoch * 86400 + h * 3600 + m * 60 + s)
-}
-
-/// syslog: `Jan 10 13:55:36` (no year — assume current year)
-fn parse_syslog_ts(ts: &str) -> Option<u64> {
-    let parts: Vec<&str> = ts.split_whitespace().collect();
-    if parts.len() < 3 { return None; }
-    let month = month_num(parts[0])?;
-    let day: u64 = parts[1].parse().ok()?;
-    let tp: Vec<&str> = parts[2].split(':').collect();
-    if tp.len() < 3 { return None; }
-    let h: u64 = tp[0].parse().ok()?;
-    let m: u64 = tp[1].parse().ok()?;
-    let s: u64 = tp[2].parse().ok()?;
-    let year = 2025u64; // fixed; relative timestamps make the exact year irrelevant
-    let days = days_from_ymd(year, month, day)?;
-    Some(days * 86400 + h * 3600 + m * 60 + s)
-}
-
-/// Apache error log: `Wed Oct 11 14:32:52.123456 2000` (day-of-week Mon DD HH:MM:SS.usec YYYY)
-fn parse_apache_error_ts(ts: &str) -> Option<u64> {
-    let parts: Vec<&str> = ts.split_whitespace().collect();
-    if parts.len() < 5 { return None; }
-    // parts: [DayOfWeek, Month, Day, HH:MM:SS[.usec], Year]
-    let month = month_num(parts[1])?;
-    let day: u64 = parts[2].parse().ok()?;
-    let time = parts[3].split('.').next()?; // strip microseconds
-    let tp: Vec<&str> = time.split(':').collect();
-    if tp.len() < 3 { return None; }
-    let h: u64 = tp[0].parse().ok()?;
-    let m: u64 = tp[1].parse().ok()?;
-    let s: u64 = tp[2].parse().ok()?;
-    let year: u64 = parts[4].parse().ok()?;
-    let days = days_from_ymd(year, month, day)?;
-    Some(days * 86400 + h * 3600 + m * 60 + s)
-}
 
 fn month_num(s: &str) -> Option<u64> {
     match s {
@@ -118,7 +167,6 @@ fn month_num(s: &str) -> Option<u64> {
     }
 }
 
-/// Days since Unix epoch (1970-01-01) for a given date. Gregorian calendar.
 fn days_from_ymd(y: u64, m: u64, d: u64) -> Option<u64> {
     if y < 1970 || m < 1 || m > 12 || d < 1 { return None; }
     let months = [0u64, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
