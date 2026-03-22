@@ -23,19 +23,17 @@ use fishy::{CollectionMetadata, Event, EventStream, LogCollection};
 use std::collections::HashMap;
 
 /// Build a frequency-ranked `Dictionary` by scanning all log lines in `inputs`.
-///
-/// Template IDs are assigned by descending frequency: the most common template
-/// gets `TemplateId(1)`, the next `TemplateId(2)`, and so on. This mirrors the
-/// core idea of Huffman coding — frequent symbols get the smallest codes.
 pub fn build_dictionary(inputs: &[LogInput]) -> Dictionary {
     let mut freqs: HashMap<String, u64> = HashMap::new();
     for input in inputs {
-        if let Ok(content) = std::fs::read_to_string(&input.path) {
-            for line in content.lines() {
-                if let Some((template, _)) =
-                    tokenizer::extract_template_and_ts(line, &input.format)
-                {
-                    *freqs.entry(template).or_insert(0) += 1;
+        for path in &input.paths {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                for line in content.lines() {
+                    if let Some((template, _)) =
+                        tokenizer::extract_template_and_ts(line, &input.format)
+                    {
+                        *freqs.entry(template).or_insert(0) += 1;
+                    }
                 }
             }
         }
@@ -58,23 +56,24 @@ pub fn encode(inputs: &[LogInput], dict: &Dictionary) -> LogCollection {
     // First pass: collect (source_id, template_id, absolute_ts) with sticky timestamps.
     let mut raw: Vec<(SourceId, analysis::TemplateId, u64)> = Vec::new();
     for input in inputs {
-        let Ok(content) = std::fs::read_to_string(&input.path) else { continue };
         let mut last_ts: Option<u64> = None;
-        for line in content.lines() {
-            let Some((template, ts_str)) =
-                tokenizer::extract_template_and_ts(line, &input.format)
-            else {
-                continue;
-            };
-            // Update sticky timestamp when this line carries one.
-            if let Some(ts_str) = ts_str {
-                if let Some(ts) = parser::parse_timestamp(&ts_str, &input.format) {
-                    last_ts = Some(ts);
-                    global_min_ts = Some(global_min_ts.map_or(ts, |m: u64| m.min(ts)));
-                    global_max_ts = Some(global_max_ts.map_or(ts, |m: u64| m.max(ts)));
+        for path in &input.paths {
+            let Ok(content) = std::fs::read_to_string(path) else { continue };
+            for line in content.lines() {
+                let Some((template, ts_str)) =
+                    tokenizer::extract_template_and_ts(line, &input.format)
+                else {
+                    continue;
+                };
+                if let Some(ts_str) = ts_str {
+                    if let Some(ts) = parser::parse_timestamp(&ts_str, &input.format) {
+                        last_ts = Some(ts);
+                        global_min_ts = Some(global_min_ts.map_or(ts, |m: u64| m.min(ts)));
+                        global_max_ts = Some(global_max_ts.map_or(ts, |m: u64| m.max(ts)));
+                    }
                 }
+                raw.push((input.source_id, dict.lookup(&template), last_ts.unwrap_or(0)));
             }
-            raw.push((input.source_id, dict.lookup(&template), last_ts.unwrap_or(0)));
         }
     }
 

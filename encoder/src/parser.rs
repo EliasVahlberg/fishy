@@ -4,11 +4,15 @@ use std::path::PathBuf;
 /// Supported log formats.
 #[derive(Clone, Debug)]
 pub enum LogFormat {
-    /// nginx/apache combined access log.
+    /// nginx/Apache combined access log (Combined Log Format).
     NginxAccess,
+    /// Apache Combined Log Format — identical parser to NginxAccess.
+    ApacheAccess,
+    /// Apache 2.4 error log: `[Day Mon DD HH:MM:SS.usec YYYY] [level] [pid N] message`
+    ApacheError,
     /// RFC 3164 / RFC 5424 syslog.
     Syslog,
-    /// One JSON object per line; specify the message field name.
+    /// One JSON object per line; specify the message field name (dotted paths supported).
     Json { message_field: String, timestamp_field: String },
     /// User-supplied regex with named captures `(?P<timestamp>...)` and `(?P<message>...)`.
     Custom { pattern: String },
@@ -17,11 +21,11 @@ pub enum LogFormat {
     Bgl,
 }
 
-/// A single log file to be encoded.
+/// A single log source, potentially spanning multiple rotated files.
 #[derive(Clone, Debug)]
 pub struct LogInput {
     pub source_id: SourceId,
-    pub path: PathBuf,
+    pub paths: Vec<PathBuf>,
     pub format: LogFormat,
 }
 
@@ -29,7 +33,8 @@ pub struct LogInput {
 /// Returns `None` if parsing fails — the event is still included with ts=0.
 pub fn parse_timestamp(ts: &str, format: &LogFormat) -> Option<u64> {
     match format {
-        LogFormat::NginxAccess => parse_nginx_ts(ts),
+        LogFormat::NginxAccess | LogFormat::ApacheAccess => parse_nginx_ts(ts),
+        LogFormat::ApacheError => parse_apache_error_ts(ts),
         LogFormat::Syslog => parse_syslog_ts(ts),
         // BGL, Json, Custom all carry Unix seconds as the timestamp string.
         LogFormat::Bgl | LogFormat::Json { .. } | LogFormat::Custom { .. } => {
@@ -79,6 +84,24 @@ fn parse_syslog_ts(ts: &str) -> Option<u64> {
     let m: u64 = tp[1].parse().ok()?;
     let s: u64 = tp[2].parse().ok()?;
     let year = 2025u64; // fixed; relative timestamps make the exact year irrelevant
+    let days = days_from_ymd(year, month, day)?;
+    Some(days * 86400 + h * 3600 + m * 60 + s)
+}
+
+/// Apache error log: `Wed Oct 11 14:32:52.123456 2000` (day-of-week Mon DD HH:MM:SS.usec YYYY)
+fn parse_apache_error_ts(ts: &str) -> Option<u64> {
+    let parts: Vec<&str> = ts.split_whitespace().collect();
+    if parts.len() < 5 { return None; }
+    // parts: [DayOfWeek, Month, Day, HH:MM:SS[.usec], Year]
+    let month = month_num(parts[1])?;
+    let day: u64 = parts[2].parse().ok()?;
+    let time = parts[3].split('.').next()?; // strip microseconds
+    let tp: Vec<&str> = time.split(':').collect();
+    if tp.len() < 3 { return None; }
+    let h: u64 = tp[0].parse().ok()?;
+    let m: u64 = tp[1].parse().ok()?;
+    let s: u64 = tp[2].parse().ok()?;
+    let year: u64 = parts[4].parse().ok()?;
     let days = days_from_ymd(year, month, day)?;
     Some(days * 86400 + h * 3600 + m * 60 + s)
 }

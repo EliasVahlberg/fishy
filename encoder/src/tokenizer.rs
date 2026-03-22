@@ -13,7 +13,8 @@ pub fn extract_template_and_ts(line: &str, format: &LogFormat) -> Option<(String
         return None;
     }
     match format {
-        LogFormat::NginxAccess => parse_nginx(line),
+        LogFormat::NginxAccess | LogFormat::ApacheAccess => parse_nginx(line),
+        LogFormat::ApacheError => parse_apache_error(line),
         LogFormat::Syslog => parse_syslog(line),
         LogFormat::Json { message_field, timestamp_field } => {
             parse_json_line(line, message_field, timestamp_field)
@@ -52,13 +53,31 @@ fn parse_syslog(line: &str) -> Option<(String, Option<String>)> {
     Some((format!("{process}: {message}"), Some(ts)))
 }
 
+/// Apache 2.4 error log: `[Wed Oct 11 14:32:52.123456 2000] [error] [pid 1234] [client ...] msg`
+fn parse_apache_error(line: &str) -> Option<(String, Option<String>)> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"^\[(\w+ \w+ +\d+ [\d:.]+\s+\d+)\] \[([^\]]+)\] (?:\[pid \d+\] )?(?:\[client [^\]]+\] )?(.+)$").unwrap()
+    });
+    let caps = re.captures(line)?;
+    let ts = caps[1].to_string();
+    let level = &caps[2];
+    let message = normalise_message(&caps[3]);
+    Some((format!("{level}: {message}"), Some(ts)))
+}
+
 fn parse_json_line(line: &str, msg_field: &str, ts_field: &str) -> Option<(String, Option<String>)> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
-    let msg = v.get(msg_field)?.as_str()?;
-    let ts = v.get(ts_field).and_then(|t| {
+    let msg = json_get_path(&v, msg_field)?.as_str()?;
+    let ts = json_get_path(&v, ts_field).and_then(|t| {
         t.as_str().map(String::from).or_else(|| t.as_u64().map(|n| n.to_string()))
     });
     Some((normalise_message(msg), ts))
+}
+
+/// Traverse a dotted field path through a JSON value (e.g. `alert.signature`).
+fn json_get_path<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    path.split('.').try_fold(v, |acc, key| acc.get(key))
 }
 
 fn parse_custom(line: &str, pattern: &str) -> Option<(String, Option<String>)> {

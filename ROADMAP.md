@@ -58,9 +58,31 @@ After this milestone: fishy is the actual product.
 - [x] `encode` CLI subcommand — writes `<source_id>.json` + `meta.json` per collection
 - [x] BGL dataset support — label-based baseline/test split, per-rack sources
 
-## Milestone 7 — Drain Encoder
+## Milestone 7 — Encoder Patch (AIT-LDSv2 Prerequisites)
+> Minimal encoder fixes required before real-world evaluation can run.
+
+- [ ] Apache Combined Log Format (`-f apache`) — standard Combined Log Format, distinct from nginx
+- [ ] Suricata JSON nested field paths (`alert.signature`, `timestamp`) — dotted path support in JSON mode
+- [ ] Multi-file source input — concatenate rotated log files (`auth.log`, `auth.log.1`, `auth.log.2`, …) into one source
+
+## Milestone 8 — AIT-LDSv2 Evaluation
+> Run fishy against a real multi-source labeled dataset and validate scores.
+> Dataset: AIT Log Data Set v2.0 (Landauer et al., IEEE TDSC 2022) — https://zenodo.org/record/5789064
+
+- [ ] Download 3 AIT-LDSv2 scenarios (~75 GB unpacked)
+- [ ] Preprocessing script — split logs by timestamp into normal/attack windows, organize into fishy's directory structure
+- [ ] Encode all collections with a shared dictionary
+- [ ] Run 4 comparison pairs: baseline↔baseline, normal↔normal, baseline↔attack, cross-scenario attack
+- [ ] Record per-method scores and verify success criteria:
+  - baseline vs baseline → score < 0.3
+  - baseline vs test_normal → score < 0.3
+  - baseline vs test_attack → score > 0.7
+- [ ] Document per-source attribution (which sources drove the divergence)
+
+## Milestone 9 — Drain Encoder
 > Replace format-specific regex parsers with a format-agnostic Drain parse tree.
 > Consistency guarantee: tree built from baseline, serialised, reused for test collection.
+> Motivation informed by M8 results — do after seeing real template quality issues.
 
 - [ ] Drain parse tree — fixed depth (3–4), token similarity threshold ~0.5, digit-containing tokens route to wildcard
 - [ ] `MaxChild` branching limit to prevent tree explosion
@@ -69,19 +91,10 @@ After this milestone: fishy is the actual product.
 - [ ] `build-dict` updated to build Drain tree in first pass, dictionary in second
 - [ ] `encode` updated to load and apply serialised Drain tree
 
-## Milestone 8 — Evaluation Framework
-> Validate that the scores mean something.
+## Milestone 10 — Score Calibration
+> Validate that the scores mean something beyond the AIT-LDSv2 evaluation.
 
 - [ ] Synthetic collection generator (`gen` binary) — inject controlled anomalies (rate shift, template swap, dependency break, spectral shift)
 - [ ] Score calibration — establish expected score ranges per anomaly type and severity
-- [ ] `top_events` population — per-source event attribution in `AnomalyReport`
 - [ ] `source_weights` actually used in scoring (currently unused field)
 - [ ] `FusionStrategy` stubs implemented (`Distributional`, `Spectral`, `Dependency`)
-- [ ] Conflict stability estimation (currently hardcoded `0.0`)
-
-## Milestone 9 — Real-World Validation
-> Run against public datasets and record results.
-
-- [ ] Loghub BGL full dataset — multi-source baseline vs. anomalous window, record per-method scores
-- [ ] Loghub HDFS — distributed system, multi-source dependency shift expected
-- [ ] Document score ranges and verdict calibration against known anomaly labels

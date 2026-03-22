@@ -70,7 +70,8 @@ fn main() {
     }
 }
 
-/// Collect log files from a directory, assigning SourceIds by sorted filename order.
+/// Collect log files from a directory, grouping rotated files (auth.log, auth.log.1, …)
+/// into a single LogInput per base name. SourceIds assigned by sorted base name order.
 fn collect_inputs(dir: &PathBuf, format_str: &str) -> Vec<LogInput> {
     let format = parse_format(format_str);
     let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -79,16 +80,56 @@ fn collect_inputs(dir: &PathBuf, format_str: &str) -> Vec<LogInput> {
         .filter(|p| p.is_file())
         .collect();
     paths.sort();
-    paths
-        .into_iter()
+
+    // Group by base name (strip trailing .N rotation suffix).
+    let mut groups: std::collections::BTreeMap<String, Vec<PathBuf>> = std::collections::BTreeMap::new();
+    for path in paths {
+        let base = log_base_name(&path);
+        groups.entry(base).or_default().push(path);
+    }
+
+    groups
+        .into_values()
         .enumerate()
-        .map(|(i, path)| LogInput { source_id: SourceId(i as u32), path, format: format.clone() })
+        .map(|(i, mut group_paths)| {
+            // Sort within group: numbered suffixes descending (oldest first), base file last.
+            group_paths.sort_by(|a, b| {
+                let a_n = rotation_number(a);
+                let b_n = rotation_number(b);
+                b_n.cmp(&a_n) // higher number = older = process first
+            });
+            LogInput { source_id: SourceId(i as u32), paths: group_paths, format: format.clone() }
+        })
         .collect()
+}
+
+/// Strip trailing `.N` rotation suffix to get the canonical source name.
+fn log_base_name(path: &std::path::Path) -> String {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    if let Some(pos) = name.rfind('.') {
+        if name[pos + 1..].chars().all(|c| c.is_ascii_digit()) {
+            return name[..pos].to_string();
+        }
+    }
+    name.to_string()
+}
+
+/// Return the rotation number from a path (e.g. `auth.log.2` → 2, `auth.log` → 0).
+fn rotation_number(path: &std::path::Path) -> u32 {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    if let Some(pos) = name.rfind('.') {
+        if let Ok(n) = name[pos + 1..].parse::<u32>() {
+            return n;
+        }
+    }
+    0
 }
 
 fn parse_format(s: &str) -> LogFormat {
     match s {
         "nginx" => LogFormat::NginxAccess,
+        "apache" => LogFormat::ApacheAccess,
+        "apache-error" => LogFormat::ApacheError,
         "syslog" => LogFormat::Syslog,
         "bgl" => LogFormat::Bgl,
         s if s.starts_with("json:") => {
