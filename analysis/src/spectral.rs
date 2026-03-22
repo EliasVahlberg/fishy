@@ -32,23 +32,23 @@ pub fn spectral_fingerprint(event_times: &[u64], bin_width: u64) -> PowerSpectru
 }
 
 /// JSD between two power spectra (treated as probability distributions).
+/// The shorter spectrum is zero-padded to match the longer one.
 pub fn spectral_divergence(baseline: &PowerSpectrum, test: &PowerSpectrum) -> f64 {
     if baseline.magnitudes.is_empty() || test.magnitudes.is_empty() {
         return 0.0;
     }
 
-    // Align to the shorter length.
-    let len = baseline.magnitudes.len().min(test.magnitudes.len());
-    let b_total: f64 = baseline.magnitudes[..len].iter().sum();
-    let t_total: f64 = test.magnitudes[..len].iter().sum();
+    let len = baseline.magnitudes.len().max(test.magnitudes.len());
+    let b_total: f64 = baseline.magnitudes.iter().sum();
+    let t_total: f64 = test.magnitudes.iter().sum();
     if b_total < 1e-10 && t_total < 1e-10 {
         return 0.0;
     }
 
     let (mut kl_bm, mut kl_tm) = (0.0f64, 0.0f64);
     for i in 0..len {
-        let p = baseline.magnitudes[i] / (b_total + 1e-10);
-        let q = test.magnitudes[i] / (t_total + 1e-10);
+        let p = baseline.magnitudes.get(i).copied().unwrap_or(0.0) / (b_total + 1e-10);
+        let q = test.magnitudes.get(i).copied().unwrap_or(0.0) / (t_total + 1e-10);
         let m = 0.5 * (p + q);
         if p > 0.0 { kl_bm += p * (p / (m + 1e-10)).ln(); }
         if q > 0.0 { kl_tm += q * (q / (m + 1e-10)).ln(); }

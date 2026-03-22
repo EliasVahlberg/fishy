@@ -80,9 +80,13 @@ fn adaptive(
     }
     for &id in pairs {
         let div = distributional_divergence(&b_rep.distributions[&id], &t_rep.distributions[&id]);
+        let top_events = extract::jsd_contributions(&b_rep.distributions[&id], &t_rep.distributions[&id])
+            .into_iter()
+            .take(10)
+            .collect();
         source_scores.insert(
             id,
-            SourceReport { divergence: div, contribution: 0.0, top_events: vec![] },
+            SourceReport { divergence: div, contribution: 0.0, top_events },
         );
     }
 
@@ -257,19 +261,25 @@ fn adaptive(
     // --- Baseline stability (sub-sample variance) — most expensive step ---
     #[cfg(feature = "parallel")]
     let b_stability = {
-        let (dist_var, (dep_var, (spec_var, co_var))) = join(
+        let (dist_var, (dep_var, (spec_var, (co_var, (conflict_var, wav_var))))) = join(
             || baseline_stability_dist(baseline, pairs),
             || {
                 join(
                     || baseline_stability_dep(baseline, pairs),
                     || join(
                         || baseline_stability_spec(baseline, pairs),
-                        || baseline_stability_co(baseline, pairs),
+                        || join(
+                            || baseline_stability_co(baseline, pairs),
+                            || join(
+                                || baseline_stability_conflict(baseline, pairs),
+                                || baseline_stability_wav(baseline, pairs),
+                            ),
+                        ),
                     ),
                 )
             },
         );
-        Stability { dist: dist_var, dep: dep_var, spec: spec_var, co: co_var, conflict: 0.0 }
+        Stability { dist: dist_var, dep: dep_var, spec: spec_var, co: co_var, conflict: conflict_var, wav: wav_var }
     };
     #[cfg(not(feature = "parallel"))]
     let b_stability = baseline_stability(baseline, pairs);
@@ -281,7 +291,7 @@ fn adaptive(
         ("spec",     spec_div,     spec_entropy,     b_stability.spec),
         ("co",       co_div,       co_entropy,       b_stability.co),
         ("conflict", conflict_div, conflict_entropy, b_stability.conflict),
-        ("wavelet",  wav_div,      wav_entropy,      0.0),
+        ("wavelet",  wav_div,      wav_entropy,      b_stability.wav),
     ];
 
     let weights: Vec<f64> = methods
@@ -442,13 +452,14 @@ struct Stability {
     spec: f64,
     co: f64,
     conflict: f64,
+    wav: f64,
 }
 
 /// Split baseline into two halves, run each method on both halves, return variance proxy.
 #[cfg(not(feature = "parallel"))]
 fn baseline_stability(baseline: &LogCollection, pairs: &[SourceId]) -> Stability {
     if pairs.is_empty() {
-        return Stability { dist: 0.0, dep: 0.0, spec: 0.0, co: 0.0, conflict: 0.0 };
+        return Stability { dist: 0.0, dep: 0.0, spec: 0.0, co: 0.0, conflict: 0.0, wav: 0.0 };
     }
     let (half_a, half_b) = split_collection(baseline, pairs);
     let ra = extract(&half_a);
@@ -458,7 +469,8 @@ fn baseline_stability(baseline: &LogCollection, pairs: &[SourceId]) -> Stability
         dep: baseline_stability_dep_reps(&ra, &rb),
         spec: baseline_stability_spec_reps(&ra, &rb, pairs),
         co: baseline_stability_co_reps(&ra, &rb, pairs),
-        conflict: 0.0,
+        conflict: baseline_stability_conflict_reps(&half_a, &half_b, pairs),
+        wav: baseline_stability_wav_reps(&ra, &rb, pairs),
     }
 }
 
@@ -485,6 +497,20 @@ fn baseline_stability_co(baseline: &LogCollection, pairs: &[SourceId]) -> f64 {
     if pairs.is_empty() { return 0.0; }
     let (a, b) = split_collection(baseline, pairs);
     baseline_stability_co_reps(&extract(&a), &extract(&b), pairs)
+}
+
+#[cfg(feature = "parallel")]
+fn baseline_stability_conflict(baseline: &LogCollection, pairs: &[SourceId]) -> f64 {
+    if pairs.is_empty() { return 0.0; }
+    let (a, b) = split_collection(baseline, pairs);
+    baseline_stability_conflict_reps(&a, &b, pairs)
+}
+
+#[cfg(feature = "parallel")]
+fn baseline_stability_wav(baseline: &LogCollection, pairs: &[SourceId]) -> f64 {
+    if pairs.is_empty() { return 0.0; }
+    let (a, b) = split_collection(baseline, pairs);
+    baseline_stability_wav_reps(&extract(&a), &extract(&b), pairs)
 }
 
 fn baseline_stability_dist_reps(
@@ -529,6 +555,55 @@ fn baseline_stability_co_reps(
     let divs: Vec<f64> = pairs
         .iter()
         .filter_map(|id| Some(eigen_divergence(ra.eigen.get(id)?, rb.eigen.get(id)?)))
+        .collect();
+    variance(&divs)
+}
+
+/// Conflict stability: variance of pairwise DS conflict across the two halves.
+fn baseline_stability_conflict_reps(
+    half_a: &LogCollection,
+    half_b: &LogCollection,
+    pairs: &[SourceId],
+) -> f64 {
+    // Compute per-source distributional divergence within each half vs. the other.
+    let ra = extract(half_a);
+    let rb = extract(half_b);
+    let bpas_a: Vec<BPA> = pairs
+        .iter()
+        .map(|id| evidence_bpa(distributional_divergence(&ra.distributions[id], &rb.distributions[id]), 1.0))
+        .collect();
+    let bpas_b: Vec<BPA> = pairs
+        .iter()
+        .map(|id| evidence_bpa(distributional_divergence(&rb.distributions[id], &ra.distributions[id]), 1.0))
+        .collect();
+    if bpas_a.len() < 2 { return 0.0; }
+    let conflict_a = pairwise_max_conflict(&bpas_a);
+    let conflict_b = pairwise_max_conflict(&bpas_b);
+    (conflict_a - conflict_b).powi(2)
+}
+
+fn pairwise_max_conflict(bpas: &[BPA]) -> f64 {
+    let mut max = 0.0f64;
+    for i in 0..bpas.len() {
+        for j in i + 1..bpas.len() {
+            max = max.max(analysis::ds_conflict(&bpas[i], &bpas[j]));
+        }
+    }
+    max
+}
+
+fn baseline_stability_wav_reps(
+    ra: &extract::Representations,
+    rb: &extract::Representations,
+    pairs: &[SourceId],
+) -> f64 {
+    const MIN_SPECTRAL_EVENTS: usize = 32;
+    let divs: Vec<f64> = pairs
+        .iter()
+        .filter_map(|id| {
+            if ra.spectra.get(id)?.magnitudes.len() < MIN_SPECTRAL_EVENTS { return None; }
+            Some(spectral_divergence(ra.spectra.get(id)?, rb.spectra.get(id)?))
+        })
         .collect();
     variance(&divs)
 }

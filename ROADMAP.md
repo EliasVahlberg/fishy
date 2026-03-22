@@ -57,3 +57,31 @@ After this milestone: fishy is the actual product.
 - [x] `build-dict` CLI subcommand — two-pass frequency count → rank
 - [x] `encode` CLI subcommand — writes `<source_id>.json` + `meta.json` per collection
 - [x] BGL dataset support — label-based baseline/test split, per-rack sources
+
+## Milestone 7 — Drain Encoder
+> Replace format-specific regex parsers with a format-agnostic Drain parse tree.
+> Consistency guarantee: tree built from baseline, serialised, reused for test collection.
+
+- [ ] Drain parse tree — fixed depth (3–4), token similarity threshold ~0.5, digit-containing tokens route to wildcard
+- [ ] `MaxChild` branching limit to prevent tree explosion
+- [ ] Single code path replaces all `LogFormat` variants
+- [ ] Serialise trained tree alongside dictionary (`drain.json` next to `dict.json`)
+- [ ] `build-dict` updated to build Drain tree in first pass, dictionary in second
+- [ ] `encode` updated to load and apply serialised Drain tree
+
+## Milestone 8 — Evaluation Framework
+> Validate that the scores mean something.
+
+- [ ] Synthetic collection generator (`gen` binary) — inject controlled anomalies (rate shift, template swap, dependency break, spectral shift)
+- [ ] Score calibration — establish expected score ranges per anomaly type and severity
+- [ ] `top_events` population — per-source event attribution in `AnomalyReport`
+- [ ] `source_weights` actually used in scoring (currently unused field)
+- [ ] `FusionStrategy` stubs implemented (`Distributional`, `Spectral`, `Dependency`)
+- [ ] Conflict stability estimation (currently hardcoded `0.0`)
+
+## Milestone 9 — Real-World Validation
+> Run against public datasets and record results.
+
+- [ ] Loghub BGL full dataset — multi-source baseline vs. anomalous window, record per-method scores
+- [ ] Loghub HDFS — distributed system, multi-source dependency shift expected
+- [ ] Document score ranges and verdict calibration against known anomaly labels

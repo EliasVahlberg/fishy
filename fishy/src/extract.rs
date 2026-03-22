@@ -87,6 +87,36 @@ pub fn to_distribution(stream: &EventStream) -> EventDistribution {
     EventDistribution { counts, total: stream.events.len() as u64 }
 }
 
+/// Per-template JSD contribution: the sum of the two KL terms for each template.
+/// Returns a vec of (template_id, contribution) sorted descending by contribution.
+pub fn jsd_contributions(
+    baseline: &EventDistribution,
+    test: &EventDistribution,
+) -> Vec<(TemplateId, f64)> {
+    let b_total = (baseline.total.max(1)) as f64;
+    let t_total = (test.total.max(1)) as f64;
+
+    // Union of all template IDs.
+    let mut ids: Vec<TemplateId> = baseline.counts.keys().chain(test.counts.keys()).copied().collect();
+    ids.sort_by_key(|t| t.0);
+    ids.dedup();
+
+    let mut out: Vec<(TemplateId, f64)> = ids
+        .into_iter()
+        .map(|tid| {
+            let p = baseline.counts.get(&tid).copied().unwrap_or(0) as f64 / b_total;
+            let q = test.counts.get(&tid).copied().unwrap_or(0) as f64 / t_total;
+            let m = 0.5 * (p + q);
+            let kl_pm = if p > 0.0 { p * (p / (m + 1e-10)).ln() } else { 0.0 };
+            let kl_qm = if q > 0.0 { q * (q / (m + 1e-10)).ln() } else { 0.0 };
+            (tid, 0.5 * (kl_pm + kl_qm) / std::f64::consts::LN_2)
+        })
+        .collect();
+
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
 pub fn event_times(stream: &EventStream) -> Vec<u64> {
     let base = stream.events.iter().filter_map(|e| e.timestamp).min().unwrap_or(0);
     stream.events.iter().filter_map(|e| e.timestamp.map(|t| t.saturating_sub(base))).collect()
