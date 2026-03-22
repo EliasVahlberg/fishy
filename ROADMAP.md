@@ -58,12 +58,12 @@ After this milestone: fishy is the actual product.
 - [x] `encode` CLI subcommand — writes `<source_id>.json` + `meta.json` per collection
 - [x] BGL dataset support — label-based baseline/test split, per-rack sources
 
-## Milestone 7 — Encoder Patch (AIT-LDSv2 Prerequisites)
+## Milestone 7 — Encoder Patch (AIT-LDSv2 Prerequisites) ✅
 > Minimal encoder fixes required before real-world evaluation can run.
 
-- [ ] Apache Combined Log Format (`-f apache`) — standard Combined Log Format, distinct from nginx
-- [ ] Suricata JSON nested field paths (`alert.signature`, `timestamp`) — dotted path support in JSON mode
-- [ ] Multi-file source input — concatenate rotated log files (`auth.log`, `auth.log.1`, `auth.log.2`, …) into one source
+- [x] Apache Combined Log Format (`-f apache`) — standard Combined Log Format, distinct from nginx
+- [x] Suricata JSON nested field paths (`alert.signature`, `timestamp`) — dotted path support in JSON mode
+- [x] Multi-file source input — concatenate rotated log files (`auth.log`, `auth.log.1`, `auth.log.2`, …) into one source
 
 ## Milestone 8 — AIT-LDSv2 Evaluation
 > Run fishy against a real multi-source labeled dataset and validate scores.
