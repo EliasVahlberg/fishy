@@ -6,57 +6,131 @@
 //!
 //! # Scenarios
 //!
-//! | Scenario        | Expected score | Primary signal                          |
-//! |-----------------|----------------|-----------------------------------------|
-//! | clean           | ≈ 0.00         | none — identical collections            |
-//! | dist_shift      | ≈ 0.18         | dist: template distribution flips       |
-//! | dep_break       | ≈ 0.10         | dep: synchronized sources desynchronize |
-//! | spectral_shift  | ≈ 0.68         | spec/wavelet: periodic → random timing  |
-//! | conflict        | ≈ 0.24         | conflict: sources disagree on normality |
-//! | multi_anomaly   | ≈ 0.60         | dist + spec + missing source            |
+//! | Scenario              | Primary signal                          |
+//! |-----------------------|-----------------------------------------|
+//! | clean                 | none — identical collections            |
+//! | dist_mild             | dist: 1 of 5 sources shifts slightly    |
+//! | dist_moderate         | dist: 2 of 5 sources shift              |
+//! | dist_severe           | dist: 3 of 5 sources shift heavily      |
+//! | spectral_mild         | wavelet: slight timing jitter           |
+//! | spectral_severe       | spec/wavelet: periodic → random timing  |
+//! | dep_break             | dep: synchronized sources desynchronize |
+//! | conflict              | conflict: sources disagree on normality |
+//! | multi_anomaly         | dist + spec + missing source            |
 
 use serde_json::{json, Value};
 use std::path::Path;
 
 fn main() {
-    write_scenario("clean",          baseline(),           baseline());
-    write_scenario("dist_shift",     baseline(),           dist_shift());
-    write_scenario("dep_break",      dep_break_baseline(), dep_break_test());
-    write_scenario("spectral_shift", spectral_baseline(),  spectral_test());
-    write_scenario("conflict",       conflict_baseline(),  conflict_test());
-    write_scenario("multi_anomaly",  baseline(),           multi_anomaly());
+    let scenarios: Vec<(&str, Vec<(u32, Value)>, Vec<(u32, Value)>)> = vec![
+        ("clean",            baseline_5(),        baseline_5()),
+        ("dist_mild",        baseline_5(),        dist_mild()),
+        ("dist_moderate",    baseline_5(),        dist_moderate()),
+        ("dist_severe",      baseline_5(),        dist_severe()),
+        ("spectral_mild",    spectral_baseline(), spectral_mild()),
+        ("spectral_severe",  spectral_baseline(), spectral_severe()),
+        ("dep_break",        dep_break_baseline(), dep_break_test()),
+        ("conflict",         conflict_baseline(), conflict_test()),
+        ("multi_anomaly",    baseline_5(),        multi_anomaly()),
+    ];
+
+    for (name, baseline, test) in scenarios {
+        write_scenario(name, baseline, test);
+    }
+
     println!("testdata/ written — run each with:");
     println!("  cargo run --bin fishy -- -b testdata/<scenario>/baseline -c testdata/<scenario>/test -v");
 }
 
 // ---------------------------------------------------------------------------
-// Scenarios
+// 5-source baseline (more realistic than 3)
 // ---------------------------------------------------------------------------
 
-/// Stable baseline: 3 sources, 1-hour window, periodic health-checks + background noise.
-fn baseline() -> Vec<(u32, Value)> {
+fn baseline_5() -> Vec<(u32, Value)> {
     vec![
         (0, periodic_source(200, &[(1, 40), (2, 30), (3, 20), (4, 10)], 120, 42)),
         (1, periodic_source(150, &[(5, 50), (6, 30), (7, 20)], 300, 7)),
         (2, periodic_source(180, &[(1, 35), (3, 35), (8, 30)], 180, 13)),
+        (3, periodic_source(160, &[(2, 45), (5, 35), (9, 20)], 240, 91)),
+        (4, periodic_source(170, &[(6, 40), (7, 30), (3, 30)], 150, 53)),
     ]
 }
 
-/// Source 0 distribution flips; sources 1 and 2 unchanged.
-/// Expected: dist fires, dep/spec/conflict quiet.
-fn dist_shift() -> Vec<(u32, Value)> {
+// ---------------------------------------------------------------------------
+// Distributional shift — graded severity
+// ---------------------------------------------------------------------------
+
+/// Mild: 1 of 5 sources has a small template shift (swap 10% weight).
+fn dist_mild() -> Vec<(u32, Value)> {
     vec![
-        (0, periodic_source(200, &[(9, 70), (2, 20), (4, 10)], 120, 42)),
+        (0, periodic_source(200, &[(1, 30), (2, 30), (3, 20), (4, 10), (9, 10)], 120, 42)),
         (1, periodic_source(150, &[(5, 50), (6, 30), (7, 20)], 300, 7)),
         (2, periodic_source(180, &[(1, 35), (3, 35), (8, 30)], 180, 13)),
+        (3, periodic_source(160, &[(2, 45), (5, 35), (9, 20)], 240, 91)),
+        (4, periodic_source(170, &[(6, 40), (7, 30), (3, 30)], 150, 53)),
     ]
 }
 
-/// Baseline: sources 0 and 1 fire at the same times with the same template (correlated).
-/// Source 2 fires independently. 3 sources needed: matrix_entropy of a 2-source MI
-/// matrix is always 0 (upper triangle has one value → entropy of [1.0] = 0).
-/// Test: all sources fire independently (different templates at same times).
-/// Same marginal template distribution in both → dist ≈ 0, dep fires.
+/// Moderate: 2 of 5 sources shift templates.
+fn dist_moderate() -> Vec<(u32, Value)> {
+    vec![
+        (0, periodic_source(200, &[(9, 50), (2, 30), (4, 20)], 120, 42)),
+        (1, periodic_source(150, &[(5, 50), (6, 30), (7, 20)], 300, 7)),
+        (2, periodic_source(180, &[(10, 50), (3, 30), (8, 20)], 180, 13)),
+        (3, periodic_source(160, &[(2, 45), (5, 35), (9, 20)], 240, 91)),
+        (4, periodic_source(170, &[(6, 40), (7, 30), (3, 30)], 150, 53)),
+    ]
+}
+
+/// Severe: 3 of 5 sources shift heavily + new templates.
+fn dist_severe() -> Vec<(u32, Value)> {
+    vec![
+        (0, periodic_source(200, &[(9, 70), (10, 20), (4, 10)], 120, 42)),
+        (1, periodic_source(150, &[(11, 60), (12, 30), (7, 10)], 300, 7)),
+        (2, periodic_source(180, &[(10, 50), (13, 30), (14, 20)], 180, 13)),
+        (3, periodic_source(160, &[(2, 45), (5, 35), (9, 20)], 240, 91)),
+        (4, periodic_source(170, &[(6, 40), (7, 30), (3, 30)], 150, 53)),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Spectral shift — graded severity
+// ---------------------------------------------------------------------------
+
+fn spectral_baseline() -> Vec<(u32, Value)> {
+    // 3 sources with strong periodic signals at different intervals
+    vec![
+        (0, timed_periodic(45, 3600, 1)),
+        (1, timed_periodic(60, 3600, 2)),
+        (2, timed_periodic(90, 3600, 3)),
+    ]
+}
+
+/// Mild: add 20% timing jitter to one source.
+fn spectral_mild() -> Vec<(u32, Value)> {
+    vec![
+        (0, timed_jittered(45, 3600, 1, 0.2, 77)),
+        (1, timed_periodic(60, 3600, 2)),
+        (2, timed_periodic(90, 3600, 3)),
+    ]
+}
+
+/// Severe: one source goes fully random timing.
+fn spectral_severe() -> Vec<(u32, Value)> {
+    let mut rng = Lcg::new(77);
+    let n = (3600u64 / 45) as usize;
+    let times: Vec<u64> = (0..n).map(|_| rng.next_u64() % 3600).collect();
+    vec![
+        (0, timed_source(&times, 1)),
+        (1, timed_periodic(60, 3600, 2)),
+        (2, timed_periodic(90, 3600, 3)),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Dependency break
+// ---------------------------------------------------------------------------
+
 fn dep_break_baseline() -> Vec<(u32, Value)> {
     let mut rng = Lcg::new(55);
     let mut rng2 = Lcg::new(99);
@@ -64,8 +138,7 @@ fn dep_break_baseline() -> Vec<(u32, Value)> {
     for t in (0u64..3600).step_by(10) {
         let tid = (rng.next_u64() >> 62) as u32 + 1;
         e0.push(json!({"template_id": tid, "timestamp": t, "params": {}}));
-        e1.push(json!({"template_id": tid, "timestamp": t, "params": {}})); // same template
-        // Source 2: same template as source 0 half the time (partial correlation → MI(0,2) > 0)
+        e1.push(json!({"template_id": tid, "timestamp": t, "params": {}}));
         let r = rng2.next_u64();
         let tid2 = if r >> 63 == 0 { tid } else { (r >> 62) as u32 + 1 };
         e2.push(json!({"template_id": tid2, "timestamp": t, "params": {}}));
@@ -78,9 +151,8 @@ fn dep_break_baseline() -> Vec<(u32, Value)> {
 }
 
 fn dep_break_test() -> Vec<(u32, Value)> {
-    // All sources fire independently — different templates at the same times.
     let mut rng0 = Lcg::new(55);
-    let mut rng1 = Lcg::new(66); // different seed → uncorrelated templates
+    let mut rng1 = Lcg::new(66);
     let mut rng2 = Lcg::new(99);
     let (mut e0, mut e1, mut e2) = (vec![], vec![], vec![]);
     for t in (0u64..3600).step_by(10) {
@@ -98,24 +170,10 @@ fn dep_break_test() -> Vec<(u32, Value)> {
     ]
 }
 
-/// Baseline: events at regular 45s intervals (strong periodic signal).
-/// Test: same count, random timing (no periodicity).
-/// Same template distribution → dist ≈ 0, spec/wavelet fire.
-fn spectral_baseline() -> Vec<(u32, Value)> {
-    let times: Vec<u64> = (0u64..3600).step_by(45).collect();
-    vec![(0, timed_source(&times, 1))]
-}
+// ---------------------------------------------------------------------------
+// Conflict
+// ---------------------------------------------------------------------------
 
-fn spectral_test() -> Vec<(u32, Value)> {
-    let mut rng = Lcg::new(77);
-    let n = (3600u64 / 45) as usize; // same event count
-    let times: Vec<u64> = (0..n).map(|_| rng.next_u64() % 3600).collect();
-    vec![(0, timed_source(&times, 1))]
-}
-
-/// Baseline: 3 sources with identical distributions.
-/// Test: source 1 has a completely different distribution; sources 0 and 2 unchanged.
-/// DS conflict between source 1's BPA and sources 0/2 should be high.
 fn conflict_baseline() -> Vec<(u32, Value)> {
     vec![
         (0, periodic_source(200, &[(1, 50), (2, 50)], 120, 11)),
@@ -127,12 +185,15 @@ fn conflict_baseline() -> Vec<(u32, Value)> {
 fn conflict_test() -> Vec<(u32, Value)> {
     vec![
         (0, periodic_source(200, &[(1, 50), (2, 50)], 120, 11)),
-        (1, periodic_source(200, &[(9, 95), (10, 5)], 120, 22)), // completely different
+        (1, periodic_source(200, &[(9, 95), (10, 5)], 120, 22)),
         (2, periodic_source(200, &[(1, 50), (2, 50)], 120, 33)),
     ]
 }
 
-/// Source 0 shifts + source 1 gains a new fast periodic process + source 2 missing.
+// ---------------------------------------------------------------------------
+// Multi-anomaly
+// ---------------------------------------------------------------------------
+
 fn multi_anomaly() -> Vec<(u32, Value)> {
     vec![
         (0, periodic_source(200, &[(9, 70), (2, 20), (4, 10)], 120, 42)),
@@ -146,7 +207,7 @@ fn multi_anomaly() -> Vec<(u32, Value)> {
             s["events"].as_array_mut().unwrap().extend(extra);
             s
         }),
-        // Source 2 absent — maximum divergence in SO mode.
+        // Sources 2-4 absent → missing source signal
     ]
 }
 
@@ -154,7 +215,6 @@ fn multi_anomaly() -> Vec<(u32, Value)> {
 // Event builders
 // ---------------------------------------------------------------------------
 
-/// Source with background noise + a periodic heartbeat at `period` seconds.
 fn periodic_source(count: u32, weights: &[(u32, u32)], period: u64, seed: u64) -> Value {
     let mut rng = Lcg::new(seed);
     let total_weight: u32 = weights.iter().map(|(_, w)| w).sum();
@@ -171,7 +231,21 @@ fn periodic_source(count: u32, weights: &[(u32, u32)], period: u64, seed: u64) -
     json!({"events": events})
 }
 
-/// Source with events at exactly the given timestamps, all using `template_id`.
+fn timed_periodic(interval: u64, duration: u64, template_id: u32) -> Value {
+    let times: Vec<u64> = (0..duration).step_by(interval as usize).collect();
+    timed_source(&times, template_id)
+}
+
+fn timed_jittered(interval: u64, duration: u64, template_id: u32, jitter_frac: f64, seed: u64) -> Value {
+    let mut rng = Lcg::new(seed);
+    let max_jitter = (interval as f64 * jitter_frac) as u64;
+    let times: Vec<u64> = (0..duration).step_by(interval as usize).map(|t| {
+        let offset = if max_jitter > 0 { rng.next_u64() % (2 * max_jitter + 1) } else { 0 };
+        (t as u64).saturating_add(offset).saturating_sub(max_jitter).min(duration - 1)
+    }).collect();
+    timed_source(&times, template_id)
+}
+
 fn timed_source(times: &[u64], template_id: u32) -> Value {
     let events: Vec<Value> = times
         .iter()

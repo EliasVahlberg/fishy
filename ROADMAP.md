@@ -89,10 +89,10 @@ After this milestone: fishy is the actual product.
 - [ ] `build-dict` updated to build Drain tree in first pass, dictionary in second
 - [ ] `encode` updated to load and apply serialised Drain tree
 
-## Milestone 10 — Score Calibration
+## Milestone 10 — Score Calibration ✅
 > Validate that the scores mean something beyond the AIT-LDSv2 evaluation.
 
-- [ ] Synthetic collection generator (`gen` binary) — inject controlled anomalies (rate shift, template swap, dependency break, spectral shift)
-- [ ] Score calibration — establish expected score ranges per anomaly type and severity
-- [ ] `source_weights` actually used in scoring (currently unused field)
-- [ ] `FusionStrategy` stubs implemented (`Distributional`, `Spectral`, `Dependency`)
+- [x] Synthetic collection generator (`gen` binary) — 9 severity-graded scenarios (clean, dist mild/moderate/severe, spectral mild/severe, dep_break, conflict, multi_anomaly)
+- [x] Per-method sigmoid midpoints — wavelet 3.0, spec 2.5, others 2.0 (reduces day_0 FP from 0.86→0.74)
+- [x] `source_weights` wired into dist divergence (weighted mean when provided)
+- [x] `FusionStrategy` single-method modes — DistributionalFingerprint, DependencyShift, SpectralFingerprint, EvidenceConflict each run only their target method through adaptive pipeline

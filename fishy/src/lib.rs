@@ -24,6 +24,17 @@ use extract::extract;
 use std::collections::HashMap;
 
 const METHODS: [&str; 6] = ["dist", "dep", "spec", "co", "conflict", "wavelet"];
+/// Per-method sigmoid midpoints for z-score → belief conversion.
+/// Higher midpoint = less sensitive (requires larger z to reach 50% commitment).
+/// Wavelet is noisiest (fires on day-to-day temporal drift), so gets 3.0.
+const METHOD_MIDPOINTS: [f64; 6] = [
+    2.0, // dist — reliable, low between-collection noise
+    2.0, // dep
+    2.5, // spec — moderate temporal sensitivity
+    2.0, // co
+    2.0, // conflict
+    3.0, // wavelet — high between-collection variance (AIT day_0 FP driver)
+];
 const MIN_SPECTRAL_EVENTS: usize = 32;
 const GATE_LOW: f64 = 0.05;
 const GATE_HIGH: f64 = 0.95;
@@ -55,10 +66,36 @@ pub fn detect(
     match config.strategy {
         FusionStrategy::Adaptive => adaptive(baseline, test, &pairs, &missing, config),
         FusionStrategy::DistributionalFingerprint => {
-            distributional_only(baseline, test, &pairs, &missing, config)
+            adaptive_single(baseline, test, &pairs, &missing, config, 0)
         }
-        _ => distributional_only(baseline, test, &pairs, &missing, config),
+        FusionStrategy::DependencyShift => {
+            adaptive_single(baseline, test, &pairs, &missing, config, 1)
+        }
+        FusionStrategy::SpectralFingerprint => {
+            adaptive_single(baseline, test, &pairs, &missing, config, 2)
+        }
+        FusionStrategy::EvidenceConflict => {
+            adaptive_single(baseline, test, &pairs, &missing, config, 4)
+        }
     }
+}
+
+/// Single-method mode: runs the full adaptive pipeline but only produces BPAs
+/// from the specified method index.
+fn adaptive_single(
+    baseline: &LogCollection,
+    test: &LogCollection,
+    pairs: &[SourceId],
+    missing: &MissingSourceReport,
+    config: &DetectConfig,
+    method_idx: usize,
+) -> Result<AnomalyReport, DetectError> {
+    // Override applicable to only include the target method
+    let mut cfg = config.clone();
+    cfg.strategy = FusionStrategy::Adaptive;
+    // We'll call adaptive directly and filter — but simpler to just mask.
+    // Re-use adaptive internals inline:
+    adaptive_inner(baseline, test, pairs, missing, &cfg, Some(method_idx))
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +108,17 @@ fn adaptive(
     pairs: &[SourceId],
     missing: &MissingSourceReport,
     config: &DetectConfig,
+) -> Result<AnomalyReport, DetectError> {
+    adaptive_inner(baseline, test, pairs, missing, config, None)
+}
+
+fn adaptive_inner(
+    baseline: &LogCollection,
+    test: &LogCollection,
+    pairs: &[SourceId],
+    missing: &MissingSourceReport,
+    config: &DetectConfig,
+    only_method: Option<usize>,
 ) -> Result<AnomalyReport, DetectError> {
     // 1. Extract representations
     #[cfg(feature = "parallel")]
@@ -94,23 +142,24 @@ fn adaptive(
     let b_entropies = method_entropies(&b_rep, pairs);
     let max_entropies = method_max_entropies(&b_rep, pairs);
     let applicable: [bool; 6] = std::array::from_fn(|i| {
+        if let Some(m) = only_method { if i != m { return false; } }
         if i == 4 { return pairs.len() >= 2; } // conflict: gate on source count only
         let norm = if max_entropies[i] > 1e-10 { b_entropies[i] / max_entropies[i] } else { 0.0 };
         norm > GATE_LOW && norm < GATE_HIGH && has_enough_events(i, baseline, pairs)
     });
 
     // 4. Method divergences + entropy deltas (baseline vs test)
-    let observations = method_divergences_and_deltas(&b_rep, &t_rep, pairs, &source_scores);
+    let observations = method_divergences_and_deltas(&b_rep, &t_rep, pairs, &source_scores, &config.source_weights);
 
     // 5. Multi-split baseline statistics (σ²_d + σ²_ΔH)
     let stats = multi_split_baseline_stats(baseline, pairs);
 
-    // 6. Z-scores → BPAs → DS combination
-    let mapping = BpaMapping::Sigmoid { midpoint: 2.0 };
+    // 6. Z-scores → BPAs → DS combination (per-method midpoints)
     let mut bpas = Vec::new();
     let mut details = Vec::new();
 
     for i in 0..6 {
+        let mapping = BpaMapping::Sigmoid { midpoint: METHOD_MIDPOINTS[i] };
         let (div, dh) = observations[i];
         let (z_d, z_dh) = if applicable[i] {
             let zd = zscore(div, stats[i].0, stats[i].1);
@@ -242,13 +291,26 @@ fn method_divergences_and_deltas(
     rb: &extract::Representations,
     pairs: &[SourceId],
     source_scores: &HashMap<SourceId, SourceReport>,
+    source_weights: &Option<HashMap<SourceId, f32>>,
 ) -> [(f64, f64); 6] {
     let dist_div = {
         let missing_max: f64 = if source_scores.values().any(|s| s.divergence >= 1.0) { 1.0 } else { 0.0 };
-        let paired_max = pairs.iter()
-            .filter_map(|id| source_scores.get(id).map(|s| s.divergence))
-            .fold(0.0f64, f64::max);
-        missing_max.max(paired_max)
+        let paired = if let Some(weights) = source_weights {
+            // Weighted mean when weights are provided
+            let (wsum, wtotal) = pairs.iter()
+                .filter_map(|id| {
+                    let d = source_scores.get(id)?.divergence;
+                    let w = *weights.get(id).unwrap_or(&1.0) as f64;
+                    Some((d * w, w))
+                })
+                .fold((0.0f64, 0.0f64), |(s, t), (d, w)| (s + d, t + w));
+            if wtotal > 0.0 { wsum / wtotal } else { 0.0 }
+        } else {
+            pairs.iter()
+                .filter_map(|id| source_scores.get(id).map(|s| s.divergence))
+                .fold(0.0f64, f64::max)
+        };
+        missing_max.max(paired)
     };
     let dist_dh = dist_entropy(rb) - dist_entropy(ra);
 
@@ -347,7 +409,7 @@ fn split_scores(
         let div = distributional_divergence(&ra.distributions[&id], &rb.distributions[&id]);
         (id, SourceReport { divergence: div, contribution: 0.0, top_events: vec![] })
     }).collect();
-    method_divergences_and_deltas(&ra, &rb, pairs, &source_divs)
+    method_divergences_and_deltas(&ra, &rb, pairs, &source_divs, &None)
 }
 
 fn quarter_split(collection: &LogCollection, pairs: &[SourceId]) -> [LogCollection; 4] {
@@ -374,47 +436,6 @@ fn merge_collections(a: &LogCollection, b: &LogCollection) -> LogCollection {
         sources.insert(*id, EventStream { events });
     }
     LogCollection { sources, metadata: a.metadata.clone() }
-}
-
-// ---------------------------------------------------------------------------
-// Distributional-only path (non-adaptive strategies)
-// ---------------------------------------------------------------------------
-
-fn distributional_only(
-    baseline: &LogCollection,
-    test: &LogCollection,
-    pairs: &[SourceId],
-    missing: &MissingSourceReport,
-    config: &DetectConfig,
-) -> Result<AnomalyReport, DetectError> {
-    let mut source_scores: HashMap<SourceId, SourceReport> = HashMap::new();
-    let mut total_div = 0.0f64;
-    let n = (pairs.len() + missing.baseline_only.len()).max(1);
-
-    for &id in &missing.baseline_only {
-        total_div += 1.0;
-        source_scores.insert(id, SourceReport { divergence: 1.0, contribution: 1.0, top_events: vec![] });
-    }
-    for &id in pairs {
-        let b_dist = extract::to_distribution(&baseline.sources[&id]);
-        let t_dist = extract::to_distribution(&test.sources[&id]);
-        let div = distributional_divergence(&b_dist, &t_dist);
-        total_div += div;
-        source_scores.insert(id, SourceReport { divergence: div, contribution: div, top_events: vec![] });
-    }
-
-    let score = (total_div / n as f64).clamp(0.0, 1.0);
-    let verdict = verdict_string(score, config.significance_threshold as f64);
-    Ok(AnomalyReport {
-        score,
-        uncertainty: 0.0,
-        verdict,
-        source_scores,
-        pair_scores: vec![],
-        missing_sources: missing.clone(),
-        meta_conflict: 0.0,
-        methods: vec![],
-    })
 }
 
 // ---------------------------------------------------------------------------
