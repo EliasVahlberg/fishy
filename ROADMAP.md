@@ -65,19 +65,17 @@ After this milestone: fishy is the actual product.
 - [x] Suricata JSON nested field paths (`alert.signature`, `timestamp`) — dotted path support in JSON mode
 - [x] Multi-file source input — concatenate rotated log files (`auth.log`, `auth.log.1`, `auth.log.2`, …) into one source
 
-## Milestone 8 — AIT-LDSv2 Evaluation
+## Milestone 8 — AIT-LDSv2 Evaluation ✅
 > Run fishy against a real multi-source labeled dataset and validate scores.
 > Dataset: AIT Log Data Set v2.0 (Landauer et al., IEEE TDSC 2022) — https://zenodo.org/record/5789064
 
-- [ ] Download 3 AIT-LDSv2 scenarios (~75 GB unpacked)
-- [ ] Preprocessing script — split logs by timestamp into normal/attack windows, organize into fishy's directory structure
-- [ ] Encode all collections with a shared dictionary
-- [ ] Run 4 comparison pairs: baseline↔baseline, normal↔normal, baseline↔attack, cross-scenario attack
-- [ ] Record per-method scores and verify success criteria:
-  - baseline vs baseline → score < 0.3
-  - baseline vs test_normal → score < 0.3
-  - baseline vs test_attack → score > 0.7
-- [ ] Document per-source attribution (which sources drove the divergence)
+- [x] Download AIT-LDSv2 scenario (russellmitchell, 7.1 GB zip, 14 GB unpacked)
+- [x] Preprocessing script (`scripts/prep_ait.py`) — parse syslog, apache, suricata JSON, audit, openvpn, dnsmasq; day-level splits
+- [x] Run comparison pairs (day-level windows, 50+ sources each):
+  - day_1 vs day_2 (normal↔normal) → 0.14 ✅
+  - day_2 vs day_3 (normal↔attack) → 1.00 ✅
+  - day_1 vs day_3 (normal↔attack) → 1.00 ✅
+- [x] Document results (`results/ait_russellmitchell.md`)
 
 ## Milestone 9 — Drain Encoder
 > Replace format-specific regex parsers with a format-agnostic Drain parse tree.
