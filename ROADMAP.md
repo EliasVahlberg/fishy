@@ -1,6 +1,6 @@
 # fishy Roadmap
 
-MVP = all five analysis methods + adaptive fusion + working CLI.
+MVP = all six analysis methods + adaptive fusion + working CLI.
 
 ## Milestone 1 — Analysis Primitives ✅
 > The math everything else depends on.
@@ -31,12 +31,12 @@ After this milestone: `fishy -b baseline/ -c test/` works.
 ## Milestone 4 — Adaptive Fusion ✅
 > The core contribution.
 
-- [x] Baseline sub-sampling for stability estimation
-- [x] Perceived entropy per method
-- [x] Weight computation: `entropy × 1/(1 + variance)`
-- [x] Weighted mean score across methods (DS combination used for `meta_conflict` only)
-- [x] Meta-conflict mass as a reported signal
-- [x] Wire all five methods into `detect()` under `FusionStrategy::Adaptive`
+- [x] Baseline sub-sampling for stability estimation (multi-split: quarter splits → 3 complementary pairs)
+- [x] Baseline entropy per method → applicability gate (normalized entropy thresholds)
+- [x] Entropy delta (ΔH) as first-class observable per method
+- [x] Z-score BPA construction: z = (observation - μ) / σ → `bpa_from_zscore` (positive z only → anomalous evidence)
+- [x] Dempster-Shafer combination as primary scoring: score = m({anomalous}), uncertainty = m(Θ)
+- [x] Wire all six methods into `detect()` under `FusionStrategy::Adaptive`
 
 After this milestone: fishy is the actual product.
 

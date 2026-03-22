@@ -70,6 +70,8 @@ pub enum FusionStrategy {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AnomalyReport {
     pub score: f64,
+    /// m(Θ) from DS combination — how much evidence remains uncommitted.
+    pub uncertainty: f64,
     pub verdict: String,
     pub source_scores: HashMap<SourceId, SourceReport>,
     pub pair_scores: Vec<PairReport>,
@@ -84,10 +86,12 @@ pub struct AnomalyReport {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MethodDetail {
     pub name: String,
+    pub applicable: bool,
     pub divergence: f64,
-    pub perceived_entropy: f64,
-    pub baseline_stability: f64,
-    pub weight: f64,
+    pub entropy_delta: f64,
+    pub baseline_entropy: f64,
+    pub z_divergence: f64,
+    pub z_entropy_delta: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

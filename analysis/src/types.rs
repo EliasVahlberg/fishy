@@ -53,3 +53,12 @@ pub struct BPA {
     /// 1.0 - normal - anomalous.
     pub uncertain: f64,
 }
+
+/// Controls how z-scores map to BPA mass values.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum BpaMapping {
+    /// commitment = 1 / (1 + exp(-(|z| - midpoint)))
+    Sigmoid { midpoint: f64 },
+    /// commitment = clamp(|z| / z_max, 0, 1)
+    Proportional { z_max: f64 },
+}

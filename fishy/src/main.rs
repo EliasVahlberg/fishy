@@ -81,19 +81,22 @@ fn main() {
 }
 
 fn print_verbose(report: &AnomalyReport) {
+    println!("  uncertainty: {:.2}", report.uncertainty);
     if report.meta_conflict > 0.05 {
         println!("  meta-conflict: {:.2} (methods disagree)", report.meta_conflict);
     }
 
     if !report.methods.is_empty() {
         println!("  methods:");
-        let w_sum: f64 = report.methods.iter().map(|m| m.weight).sum();
         for m in &report.methods {
-            let pct = if w_sum > 1e-10 { m.weight / w_sum * 100.0 } else { 0.0 };
-            println!(
-                "    {:>10}: div={:.2}  entropy={:.2}  stability={:.2}  weight={:.1}%",
-                m.name, m.divergence, m.perceived_entropy, m.baseline_stability, pct
-            );
+            if m.applicable {
+                println!(
+                    "    {:>10}: div={:.2}  ΔH={:+.3}  z_d={:+.1}  z_ΔH={:+.1}  H_b={:.2}",
+                    m.name, m.divergence, m.entropy_delta, m.z_divergence, m.z_entropy_delta, m.baseline_entropy
+                );
+            } else {
+                println!("    {:>10}: (skipped — not applicable)", m.name);
+            }
         }
     }
 

@@ -1,7 +1,8 @@
 use crate::types::{EventStream, LogCollection, SourceId};
 use analysis::{
     co_occurrence_spectrum, mutual_information_matrix_timed, spectral_fingerprint,
-    EventDistribution, EigenSpectrum, MIMatrix, PowerSpectrum, TemplateId,
+    wavelet_decompose, EventDistribution, EigenSpectrum, MIMatrix, PowerSpectrum, TemplateId,
+    WaveletCoefficients,
 };
 use std::collections::HashMap;
 
@@ -13,11 +14,10 @@ pub struct Representations {
     pub spectra: HashMap<SourceId, PowerSpectrum>,
     /// Per-source co-occurrence eigenspectra.
     pub eigen: HashMap<SourceId, EigenSpectrum>,
+    /// Per-source wavelet decompositions.
+    pub wavelets: HashMap<SourceId, WaveletCoefficients>,
     /// Cross-source MI matrix (None if <2 sources).
     pub mi_matrix: Option<MIMatrix>,
-    /// Ordered source list used to build the MI matrix (reserved for future use).
-    #[allow(dead_code)]
-    pub mi_sources: Vec<SourceId>,
 }
 
 /// Bin width for spectral analysis — scales with collection duration.
@@ -63,20 +63,27 @@ pub fn extract_with(collection: &LogCollection, bin_width: u64, co_window: u64) 
         })
         .collect();
 
-    let (mi_matrix, mi_sources) = if sources.len() >= 2 {
+    let wavelets = sources
+        .iter()
+        .map(|&id| {
+            let times = event_times(&collection.sources[&id]);
+            (id, wavelet_decompose(&times, bin_width, 4))
+        })
+        .collect();
+
+    let mi_matrix = if sources.len() >= 2 {
         let timed: Vec<Vec<(TemplateId, u64)>> = sources
             .iter()
             .map(|id| timed_events(&collection.sources[id]))
             .collect();
         let col_refs: Vec<(SourceId, &[(TemplateId, u64)])> =
             sources.iter().zip(timed.iter()).map(|(&id, v)| (id, v.as_slice())).collect();
-        let m = mutual_information_matrix_timed(&col_refs, bin_width);
-        (Some(m), sources.clone())
+        Some(mutual_information_matrix_timed(&col_refs, bin_width))
     } else {
-        (None, vec![])
+        None
     };
 
-    Representations { distributions, spectra, eigen, mi_matrix, mi_sources }
+    Representations { distributions, spectra, eigen, wavelets, mi_matrix }
 }
 
 pub fn to_distribution(stream: &EventStream) -> EventDistribution {

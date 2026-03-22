@@ -16,11 +16,17 @@ pub use loader::load_collection;
 pub use types::*;
 
 use analysis::{
-    distributional_divergence, evidence_bpa, matrix_entropy, mi_matrix_divergence,
-    shannon_entropy, spectral_divergence, spectral_entropy, wavelet_decompose, BPA,
+    bpa_from_zscore, distributional_divergence, ds_combine_many, evidence_bpa, matrix_entropy,
+    mi_matrix_divergence, shannon_entropy, spectral_divergence, spectral_entropy, BPA,
+    BpaMapping,
 };
-use extract::{adaptive_bin_width, extract, to_distribution};
+use extract::extract;
 use std::collections::HashMap;
+
+const METHODS: [&str; 6] = ["dist", "dep", "spec", "co", "conflict", "wavelet"];
+const MIN_SPECTRAL_EVENTS: usize = 32;
+const GATE_LOW: f64 = 0.05;
+const GATE_HIGH: f64 = 0.95;
 
 pub fn detect(
     baseline: &LogCollection,
@@ -34,7 +40,6 @@ pub fn detect(
     let b_dur = baseline.metadata.end_time.saturating_sub(baseline.metadata.start_time);
     let t_dur = test.metadata.end_time.saturating_sub(test.metadata.start_time);
     let tol = config.duration_tolerance as f64;
-    // tol == 0.0 disables the temporal check entirely.
     if tol > 0.0 && b_dur > 0 && t_dur > 0 {
         let ratio = b_dur.max(t_dur) as f64 / b_dur.min(t_dur) as f64;
         if ratio > (1.0 + tol) {
@@ -57,7 +62,7 @@ pub fn detect(
 }
 
 // ---------------------------------------------------------------------------
-// Adaptive fusion
+// Adaptive fusion — entropy-as-observation pipeline
 // ---------------------------------------------------------------------------
 
 fn adaptive(
@@ -67,333 +72,308 @@ fn adaptive(
     missing: &MissingSourceReport,
     config: &DetectConfig,
 ) -> Result<AnomalyReport, DetectError> {
-    let b_rep = extract(baseline);
-    let t_rep = extract(test);
+    // 1. Extract representations
+    #[cfg(feature = "parallel")]
+    let (b_rep, t_rep) = join(|| extract(baseline), || extract(test));
+    #[cfg(not(feature = "parallel"))]
+    let (b_rep, t_rep) = (extract(baseline), extract(test));
 
-    // --- Per-source distributional divergences ---
+    // 2. Per-source distributional divergences
     let mut source_scores: HashMap<SourceId, SourceReport> = HashMap::new();
     for &id in &missing.baseline_only {
-        source_scores.insert(
-            id,
-            SourceReport { divergence: 1.0, contribution: 1.0, top_events: vec![] },
-        );
+        source_scores.insert(id, SourceReport { divergence: 1.0, contribution: 1.0, top_events: vec![] });
     }
     for &id in pairs {
         let div = distributional_divergence(&b_rep.distributions[&id], &t_rep.distributions[&id]);
         let top_events = extract::jsd_contributions(&b_rep.distributions[&id], &t_rep.distributions[&id])
-            .into_iter()
-            .take(10)
-            .collect();
-        source_scores.insert(
-            id,
-            SourceReport { divergence: div, contribution: 0.0, top_events },
-        );
+            .into_iter().take(10).collect();
+        source_scores.insert(id, SourceReport { divergence: div, contribution: 0.0, top_events });
     }
 
-    // --- Method divergences (max across sources — any anomalous source flags the collection) ---
-    // 1. Distributional: max JSD across paired sources + 1.0 per missing source.
-    let dist_div = {
-        let missing_max: f64 = if missing.baseline_only.is_empty() { 0.0 } else { 1.0 };
-        let paired_max: f64 = pairs
-            .iter()
-            .map(|id| source_scores[id].divergence)
-            .fold(0.0f64, f64::max);
-        missing_max.max(paired_max)
-    };
+    // 3. Baseline entropy + applicability gate
+    let b_entropies = method_entropies(&b_rep, pairs);
+    let max_entropies = method_max_entropies(&b_rep, pairs);
+    let applicable: [bool; 6] = std::array::from_fn(|i| {
+        if i == 4 { return pairs.len() >= 2; } // conflict: gate on source count only
+        let norm = if max_entropies[i] > 1e-10 { b_entropies[i] / max_entropies[i] } else { 0.0 };
+        norm > GATE_LOW && norm < GATE_HIGH && has_enough_events(i, baseline, pairs)
+    });
 
-    // 2. Dependency shift: MI matrix divergence — skip if <2 paired sources.
-    let dep_div = if pairs.len() >= 2 {
-        match (&b_rep.mi_matrix, &t_rep.mi_matrix) {
-            (Some(bm), Some(tm)) => mi_matrix_divergence(bm, tm),
-            _ => 0.0,
-        }
+    // 4. Method divergences + entropy deltas (baseline vs test)
+    let observations = method_divergences_and_deltas(&b_rep, &t_rep, pairs, &source_scores);
+
+    // 5. Multi-split baseline statistics (σ²_d + σ²_ΔH)
+    let stats = multi_split_baseline_stats(baseline, pairs);
+
+    // 6. Z-scores → BPAs → DS combination
+    let mapping = BpaMapping::Sigmoid { midpoint: 2.0 };
+    let mut bpas = Vec::new();
+    let mut details = Vec::new();
+
+    for i in 0..6 {
+        let (div, dh) = observations[i];
+        let (z_d, z_dh) = if applicable[i] {
+            let zd = zscore(div, stats[i].0, stats[i].1);
+            let zdh = zscore(dh.abs(), stats[i].2, stats[i].3);
+            // Only positive z-scores produce evidence; below-baseline = uncertain
+            if zd > 0.0 { bpas.push(bpa_from_zscore(zd, &mapping)); }
+            if i != 4 && zdh > 0.0 { bpas.push(bpa_from_zscore(zdh, &mapping)); }
+            (zd, zdh)
+        } else {
+            (0.0, 0.0)
+        };
+
+        details.push(MethodDetail {
+            name: METHODS[i].to_string(),
+            applicable: applicable[i],
+            divergence: div,
+            entropy_delta: dh,
+            baseline_entropy: b_entropies[i],
+            z_divergence: z_d,
+            z_entropy_delta: z_dh,
+        });
+    }
+
+    // 7. Fuse
+    let fused = if bpas.is_empty() {
+        BPA { normal: 0.0, anomalous: 0.0, uncertain: 1.0 }
     } else {
-        0.0
+        ds_combine_many(&bpas)
     };
 
-    // Minimum events required for frequency-domain methods to be meaningful.
-    const MIN_SPECTRAL_EVENTS: usize = 32;
+    let score = fused.anomalous.clamp(0.0, 1.0);
+    let uncertainty = fused.uncertain;
 
-    let b_dur = baseline.metadata.end_time.saturating_sub(baseline.metadata.start_time);
-    let bin_width = adaptive_bin_width(b_dur);
-
-    // 3. Spectral: max spectral divergence across paired sources.
-    let spec_div = pairs
-        .iter()
-        .filter_map(|id| {
-            let stream = baseline.sources.get(id)?;
-            if stream.events.len() < MIN_SPECTRAL_EVENTS {
-                return None;
-            }
-            let bs = b_rep.spectra.get(id)?;
-            let ts = t_rep.spectra.get(id)?;
-            if bs.magnitudes.is_empty() || ts.magnitudes.is_empty() {
-                None
-            } else {
-                Some(spectral_divergence(bs, ts))
-            }
-        })
-        .fold(0.0f64, f64::max);
-
-    // 4. Co-occurrence: max eigenspectrum divergence across paired sources.
-    let co_div = pairs
-        .iter()
-        .filter_map(|id| {
-            let stream = baseline.sources.get(id)?;
-            if stream.events.len() < MIN_SPECTRAL_EVENTS {
-                return None;
-            }
-            Some(eigen_divergence(b_rep.eigen.get(id)?, t_rep.eigen.get(id)?))
-        })
-        .fold(0.0f64, f64::max);
-
-    // 5. Evidence conflict: pairwise DS conflict between per-source BPAs.
-    let conflict_div = {
-        let bpas: Vec<BPA> = pairs
-            .iter()
-            .map(|id| evidence_bpa(source_scores[id].divergence, 1.0))
-            .collect();
-        if bpas.len() < 2 {
-            0.0
-        } else {
-            let mut max_conflict = 0.0f64;
-            for i in 0..bpas.len() {
-                for j in i + 1..bpas.len() {
-                    max_conflict = max_conflict.max(analysis::ds_conflict(&bpas[i], &bpas[j]));
-                }
-            }
-            max_conflict
-        }
-    };
-
-    // 6. Wavelet: max detail-level energy divergence across paired sources.
-    let wav_div = pairs
-        .iter()
-        .filter_map(|id| {
-            let stream = baseline.sources.get(id)?;
-            if stream.events.len() < MIN_SPECTRAL_EVENTS {
-                return None;
-            }
-            let b_times = extract::event_times(&baseline.sources[id]);
-            let t_times = extract::event_times(&test.sources[id]);
-            let bw = wavelet_decompose(&b_times, bin_width, 4);
-            let tw = wavelet_decompose(&t_times, bin_width, 4);
-            // Compare energy at each detail level; take max divergence across levels.
-            let div = bw.levels.iter().zip(tw.levels.iter()).map(|(bl, tl)| {
-                let b_e: f64 = bl.iter().map(|x| x * x).sum();
-                let t_e: f64 = tl.iter().map(|x| x * x).sum();
-                let denom = b_e.max(t_e);
-                if denom < 1e-10 { 0.0 } else { (b_e - t_e).abs() / denom }
-            }).fold(0.0f64, f64::max);
-            Some(div)
-        })
-        .fold(0.0f64, f64::max);
-
-    // --- Perceived entropy per method (from baseline) ---
-    let dist_entropy = {
-        let all_counts: Vec<f64> = b_rep
-            .distributions
-            .values()
-            .flat_map(|d| {
-                let total = d.total.max(1) as f64;
-                d.counts.values().map(move |&c| c as f64 / total)
-            })
-            .collect();
-        shannon_entropy(&all_counts)
-    };
-
-    let dep_entropy = b_rep.mi_matrix.as_ref().map(|m| matrix_entropy(m)).unwrap_or(0.0);
-
-    let spec_entropy = {
-        let vals: Vec<f64> = b_rep.spectra.values().map(|s| spectral_entropy(s)).collect();
-        if vals.is_empty() { 0.0 } else { vals.iter().sum::<f64>() / vals.len() as f64 }
-    };
-
-    let co_entropy = {
-        let vals: Vec<f64> = b_rep
-            .eigen
-            .values()
-            .map(|e| {
-                let total: f64 = e.eigenvalues.iter().sum();
-                if total < 1e-10 {
-                    return 0.0;
-                }
-                let norm: Vec<f64> = e.eigenvalues.iter().map(|&v| v / total).collect();
-                shannon_entropy(&norm)
-            })
-            .collect();
-        if vals.is_empty() { 0.0 } else { vals.iter().sum::<f64>() / vals.len() as f64 }
-    };
-
-    // Conflict entropy: entropy of the per-source divergence distribution.
-    let conflict_entropy = {
-        let divs: Vec<f64> = pairs.iter().map(|id| source_scores[id].divergence).collect();
-        let total: f64 = divs.iter().sum();
-        if total < 1e-10 {
-            0.0
-        } else {
-            let norm: Vec<f64> = divs.iter().map(|&d| d / total).collect();
-            shannon_entropy(&norm)
-        }
-    };
-
-    // Wavelet entropy: mean energy distribution entropy across detail levels.
-    let wav_entropy = {
-        let vals: Vec<f64> = pairs
-            .iter()
-            .filter_map(|id| {
-                let stream = baseline.sources.get(id)?;
-                if stream.events.len() < MIN_SPECTRAL_EVENTS { return None; }
-                let times = extract::event_times(stream);
-                let wc = wavelet_decompose(&times, bin_width, 4);
-                let energies: Vec<f64> = wc.levels.iter()
-                    .map(|l| l.iter().map(|x| x * x).sum::<f64>())
-                    .collect();
-                let total: f64 = energies.iter().sum();
-                if total < 1e-10 { return None; }
-                let norm: Vec<f64> = energies.iter().map(|&e| e / total).collect();
-                Some(shannon_entropy(&norm))
-            })
-            .collect();
-        if vals.is_empty() { 0.0 } else { vals.iter().sum::<f64>() / vals.len() as f64 }
-    };
-
-    // --- Baseline stability (sub-sample variance) — most expensive step ---
-    #[cfg(feature = "parallel")]
-    let b_stability = {
-        let (dist_var, (dep_var, (spec_var, (co_var, (conflict_var, wav_var))))) = join(
-            || baseline_stability_dist(baseline, pairs),
-            || {
-                join(
-                    || baseline_stability_dep(baseline, pairs),
-                    || join(
-                        || baseline_stability_spec(baseline, pairs),
-                        || join(
-                            || baseline_stability_co(baseline, pairs),
-                            || join(
-                                || baseline_stability_conflict(baseline, pairs),
-                                || baseline_stability_wav(baseline, pairs),
-                            ),
-                        ),
-                    ),
-                )
-            },
-        );
-        Stability { dist: dist_var, dep: dep_var, spec: spec_var, co: co_var, conflict: conflict_var, wav: wav_var }
-    };
-    #[cfg(not(feature = "parallel"))]
-    let b_stability = baseline_stability(baseline, pairs);
-
-    // --- Weights: entropy × 1/(1+variance) ---
-    let methods: &[(&str, f64, f64, f64)] = &[
-        ("dist",     dist_div,     dist_entropy,     b_stability.dist),
-        ("dep",      dep_div,      dep_entropy,      b_stability.dep),
-        ("spec",     spec_div,     spec_entropy,     b_stability.spec),
-        ("co",       co_div,       co_entropy,       b_stability.co),
-        ("conflict", conflict_div, conflict_entropy, b_stability.conflict),
-        ("wavelet",  wav_div,      wav_entropy,      b_stability.wav),
-    ];
-
-    let weights: Vec<f64> = methods
-        .iter()
-        .map(|(_, _, entropy, variance)| entropy / (1.0 + variance))
-        .collect();
-    let weight_sum: f64 = weights.iter().sum();
-
-    // --- DS meta-combination (for meta_conflict signal only) ---
-    let meta_bpas: Vec<BPA> = methods
-        .iter()
-        .zip(weights.iter())
-        .map(|((_, div, _, _), &w)| {
-            let confidence = if weight_sum > 1e-10 { (w / weight_sum).clamp(0.0, 1.0) } else { 0.2 };
-            evidence_bpa(*div, confidence)
-        })
-        .collect();
-
-    let meta_conflict: f64 = {
+    let meta_conflict = if bpas.len() < 2 { 0.0 } else {
         let mut total = 0.0f64;
         let mut count = 0usize;
-        for i in 0..meta_bpas.len() {
-            for j in i + 1..meta_bpas.len() {
-                total += analysis::ds_conflict(&meta_bpas[i], &meta_bpas[j]);
+        for i in 0..bpas.len() {
+            for j in i + 1..bpas.len() {
+                total += analysis::ds_conflict(&bpas[i], &bpas[j]);
                 count += 1;
             }
         }
-        if count > 0 { total / count as f64 } else { 0.0 }
+        total / count as f64
     };
 
-    // Score = weighted mean of method divergences.
-    // DS combination is used only for meta_conflict (inter-method disagreement signal).
-    let score = if weight_sum > 1e-10 {
-        methods.iter().zip(weights.iter()).map(|((_, div, _, _), &w)| div * w).sum::<f64>()
-            / weight_sum
-    } else {
-        methods.iter().map(|(_, div, _, _)| *div).sum::<f64>() / methods.len() as f64
-    }
-    .clamp(0.0, 1.0);
-
-    // Update source contribution from final score.
     for report in source_scores.values_mut() {
         report.contribution = report.divergence * score;
     }
 
-    // Populate pair_scores from MI matrix diagonal entries.
-    let pair_scores: Vec<PairReport> = if pairs.len() >= 2 {
-        match (&b_rep.mi_matrix, &t_rep.mi_matrix) {
-            (Some(bm), Some(tm)) => {
-                let b_idx: HashMap<SourceId, usize> =
-                    bm.sources.iter().enumerate().map(|(i, &id)| (id, i)).collect();
-                let t_idx: HashMap<SourceId, usize> =
-                    tm.sources.iter().enumerate().map(|(i, &id)| (id, i)).collect();
-                let mut out = vec![];
-                for i in 0..pairs.len() {
-                    for j in i + 1..pairs.len() {
-                        let a = pairs[i];
-                        let b = pairs[j];
-                        let b_mi = b_idx.get(&a).and_then(|&ai| b_idx.get(&b).map(|&bi| bm.values[ai][bi])).unwrap_or(0.0);
-                        let t_mi = t_idx.get(&a).and_then(|&ai| t_idx.get(&b).map(|&bi| tm.values[ai][bi])).unwrap_or(0.0);
-                        let denom = b_mi.max(t_mi);
-                        let dep_shift = if denom < 1e-10 { 0.0 } else { (b_mi - t_mi).abs() / denom };
-                        out.push(PairReport {
-                            source_a: a,
-                            source_b: b,
-                            dependency_shift: dep_shift,
-                            baseline_correlation: b_mi,
-                            test_correlation: t_mi,
-                        });
-                    }
-                }
-                out
-            }
-            _ => vec![],
-        }
-    } else {
-        vec![]
-    };
-
+    let pair_scores = compute_pair_scores(&b_rep, &t_rep, pairs);
     let verdict = verdict_string(score, config.significance_threshold as f64);
-
-    let method_details: Vec<MethodDetail> = methods
-        .iter()
-        .zip(weights.iter())
-        .map(|((name, div, entropy, variance), &w)| MethodDetail {
-            name: name.to_string(),
-            divergence: *div,
-            perceived_entropy: *entropy,
-            baseline_stability: *variance,
-            weight: w,
-        })
-        .collect();
 
     Ok(AnomalyReport {
         score,
+        uncertainty,
         verdict,
         source_scores,
         pair_scores,
         missing_sources: missing.clone(),
         meta_conflict,
-        methods: method_details,
+        methods: details,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Per-method entropy (from baseline representations)
+// ---------------------------------------------------------------------------
+
+fn method_entropies(rep: &extract::Representations, _pairs: &[SourceId]) -> [f64; 6] {
+    let dist = mean_of(rep.distributions.values().map(|d| {
+        let t = d.total.max(1) as f64;
+        let probs: Vec<f64> = d.counts.values().map(|&c| c as f64 / t).collect();
+        shannon_entropy(&probs)
+    }));
+    let dep = rep.mi_matrix.as_ref().map(|m| matrix_entropy(m)).unwrap_or(0.0);
+    let spec = mean_of(rep.spectra.values().map(|s| spectral_entropy(s)));
+    let co = mean_of(rep.eigen.values().map(|e| {
+        let total: f64 = e.eigenvalues.iter().sum();
+        if total < 1e-10 { 0.0 } else {
+            let norm: Vec<f64> = e.eigenvalues.iter().map(|&v| v / total).collect();
+            shannon_entropy(&norm)
+        }
+    }));
+    let conflict = 0.5; // no intrinsic entropy; always passes gate via special case
+    let wav = mean_of(rep.wavelets.values().filter_map(|wc| {
+        let energies: Vec<f64> = wc.levels.iter().map(|l| l.iter().map(|x| x * x).sum::<f64>()).collect();
+        let total: f64 = energies.iter().sum();
+        if total < 1e-10 { return None; }
+        let norm: Vec<f64> = energies.iter().map(|&e| e / total).collect();
+        Some(shannon_entropy(&norm))
+    }));
+    [dist, dep, spec, co, conflict, wav]
+}
+
+/// Maximum possible entropy per method (ln(N) where N = number of categories).
+fn method_max_entropies(rep: &extract::Representations, _pairs: &[SourceId]) -> [f64; 6] {
+    let dist_n: usize = rep.distributions.values().map(|d| d.counts.len()).max().unwrap_or(0);
+    let dep_n = rep.mi_matrix.as_ref().map(|m| { let n = m.sources.len(); n * (n - 1) / 2 }).unwrap_or(0);
+    let spec_n = rep.spectra.values().map(|s| s.magnitudes.len()).max().unwrap_or(0);
+    let co_n = rep.eigen.values().map(|e| e.eigenvalues.len()).max().unwrap_or(0);
+    let wav_n = rep.wavelets.values().map(|w| w.levels.len()).max().unwrap_or(0);
+    [
+        if dist_n > 1 { (dist_n as f64).ln() } else { 0.0 },
+        if dep_n > 1 { (dep_n as f64).ln() } else { 0.0 },
+        if spec_n > 1 { (spec_n as f64).ln() } else { 0.0 },
+        if co_n > 1 { (co_n as f64).ln() } else { 0.0 },
+        1.0, // conflict: placeholder
+        if wav_n > 1 { (wav_n as f64).ln() } else { 0.0 },
+    ]
+}
+
+fn has_enough_events(method_idx: usize, baseline: &LogCollection, pairs: &[SourceId]) -> bool {
+    match method_idx {
+        0 => true, // dist: always ok
+        1 => pairs.len() >= 2, // dep: need ≥2 sources
+        2 | 3 | 5 => pairs.iter().any(|id| {
+            baseline.sources.get(id).map(|s| s.events.len() >= MIN_SPECTRAL_EVENTS).unwrap_or(false)
+        }),
+        _ => true,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-method divergence + entropy delta
+// ---------------------------------------------------------------------------
+
+fn method_divergences_and_deltas(
+    ra: &extract::Representations,
+    rb: &extract::Representations,
+    pairs: &[SourceId],
+    source_scores: &HashMap<SourceId, SourceReport>,
+) -> [(f64, f64); 6] {
+    let dist_div = {
+        let missing_max: f64 = if source_scores.values().any(|s| s.divergence >= 1.0) { 1.0 } else { 0.0 };
+        let paired_max = pairs.iter()
+            .filter_map(|id| source_scores.get(id).map(|s| s.divergence))
+            .fold(0.0f64, f64::max);
+        missing_max.max(paired_max)
+    };
+    let dist_dh = dist_entropy(rb) - dist_entropy(ra);
+
+    let dep_div = match (&ra.mi_matrix, &rb.mi_matrix) {
+        (Some(ma), Some(mb)) => mi_matrix_divergence(ma, mb),
+        _ => 0.0,
+    };
+    let dep_dh = match (&ra.mi_matrix, &rb.mi_matrix) {
+        (Some(ma), Some(mb)) => matrix_entropy(mb) - matrix_entropy(ma),
+        _ => 0.0,
+    };
+
+    let spec_div = pairs.iter()
+        .filter_map(|id| Some(spectral_divergence(ra.spectra.get(id)?, rb.spectra.get(id)?)))
+        .fold(0.0f64, f64::max);
+    let spec_dh = mean_of(rb.spectra.values().map(|s| spectral_entropy(s)))
+        - mean_of(ra.spectra.values().map(|s| spectral_entropy(s)));
+
+    let co_div = pairs.iter()
+        .filter_map(|id| Some(eigen_divergence(ra.eigen.get(id)?, rb.eigen.get(id)?)))
+        .fold(0.0f64, f64::max);
+    let co_dh = eigen_entropy_mean(rb) - eigen_entropy_mean(ra);
+
+    let conflict_div = {
+        let bpas: Vec<BPA> = pairs.iter()
+            .filter_map(|id| source_scores.get(id).map(|s| evidence_bpa(s.divergence, 1.0)))
+            .collect();
+        pairwise_max_conflict(&bpas)
+    };
+
+    let wav_div = pairs.iter()
+        .filter_map(|id| Some(wavelet_divergence(ra.wavelets.get(id)?, rb.wavelets.get(id)?)))
+        .fold(0.0f64, f64::max);
+    let wav_dh = wavelet_entropy_mean(rb) - wavelet_entropy_mean(ra);
+
+    [
+        (dist_div, dist_dh),
+        (dep_div, dep_dh),
+        (spec_div, spec_dh),
+        (co_div, co_dh),
+        (conflict_div, 0.0),
+        (wav_div, wav_dh),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Multi-split baseline statistics
+// ---------------------------------------------------------------------------
+
+/// Returns per-method (mean_d, var_d, mean_|ΔH|, var_|ΔH|) from 3 quarter-pair splits.
+fn multi_split_baseline_stats(baseline: &LogCollection, pairs: &[SourceId]) -> [(f64, f64, f64, f64); 6] {
+    if pairs.is_empty() {
+        return [(0.0, 0.0, 0.0, 0.0); 6];
+    }
+
+    let q = quarter_split(baseline, pairs);
+    // 3 complementary half-pair partitions
+    let partition_indices: [(usize, usize, usize, usize); 3] = [
+        (0, 1, 2, 3), // (Q0+Q1) vs (Q2+Q3)
+        (0, 2, 1, 3), // (Q0+Q2) vs (Q1+Q3)
+        (0, 3, 1, 2), // (Q0+Q3) vs (Q1+Q2)
+    ];
+
+    #[cfg(feature = "parallel")]
+    let samples = {
+        let (s0, (s1, s2)) = join(
+            || split_scores(&q, partition_indices[0], pairs),
+            || join(
+                || split_scores(&q, partition_indices[1], pairs),
+                || split_scores(&q, partition_indices[2], pairs),
+            ),
+        );
+        [s0, s1, s2]
+    };
+    #[cfg(not(feature = "parallel"))]
+    let samples = partition_indices.map(|p| split_scores(&q, p, pairs));
+
+    std::array::from_fn(|m| {
+        let ds: [f64; 3] = std::array::from_fn(|s| samples[s][m].0);
+        let dhs: [f64; 3] = std::array::from_fn(|s| samples[s][m].1.abs());
+        (mean_arr(&ds), variance_arr(&ds), mean_arr(&dhs), variance_arr(&dhs))
+    })
+}
+
+fn split_scores(
+    q: &[LogCollection; 4],
+    (a, b, c, d): (usize, usize, usize, usize),
+    pairs: &[SourceId],
+) -> [(f64, f64); 6] {
+    let ha = merge_collections(&q[a], &q[b]);
+    let hb = merge_collections(&q[c], &q[d]);
+    let ra = extract(&ha);
+    let rb = extract(&hb);
+    // Compute per-source divergences for conflict method
+    let source_divs: HashMap<SourceId, SourceReport> = pairs.iter().map(|&id| {
+        let div = distributional_divergence(&ra.distributions[&id], &rb.distributions[&id]);
+        (id, SourceReport { divergence: div, contribution: 0.0, top_events: vec![] })
+    }).collect();
+    method_divergences_and_deltas(&ra, &rb, pairs, &source_divs)
+}
+
+fn quarter_split(collection: &LogCollection, pairs: &[SourceId]) -> [LogCollection; 4] {
+    let meta = collection.metadata.clone();
+    let mut qs: [HashMap<SourceId, EventStream>; 4] = Default::default();
+    for &id in pairs {
+        let events = &collection.sources[&id].events;
+        let q = events.len() / 4;
+        qs[0].insert(id, EventStream { events: events[..q].to_vec() });
+        qs[1].insert(id, EventStream { events: events[q..2 * q].to_vec() });
+        qs[2].insert(id, EventStream { events: events[2 * q..3 * q].to_vec() });
+        qs[3].insert(id, EventStream { events: events[3 * q..].to_vec() });
+    }
+    qs.map(|sources| LogCollection { sources, metadata: meta.clone() })
+}
+
+fn merge_collections(a: &LogCollection, b: &LogCollection) -> LogCollection {
+    let mut sources = HashMap::new();
+    for (id, stream) in &a.sources {
+        let mut events = stream.events.clone();
+        if let Some(other) = b.sources.get(id) {
+            events.extend_from_slice(&other.events);
+        }
+        sources.insert(*id, EventStream { events });
+    }
+    LogCollection { sources, metadata: a.metadata.clone() }
 }
 
 // ---------------------------------------------------------------------------
@@ -413,26 +393,21 @@ fn distributional_only(
 
     for &id in &missing.baseline_only {
         total_div += 1.0;
-        source_scores.insert(
-            id,
-            SourceReport { divergence: 1.0, contribution: 1.0, top_events: vec![] },
-        );
+        source_scores.insert(id, SourceReport { divergence: 1.0, contribution: 1.0, top_events: vec![] });
     }
     for &id in pairs {
-        let b_dist = to_distribution(&baseline.sources[&id]);
-        let t_dist = to_distribution(&test.sources[&id]);
+        let b_dist = extract::to_distribution(&baseline.sources[&id]);
+        let t_dist = extract::to_distribution(&test.sources[&id]);
         let div = distributional_divergence(&b_dist, &t_dist);
         total_div += div;
-        source_scores.insert(
-            id,
-            SourceReport { divergence: div, contribution: div, top_events: vec![] },
-        );
+        source_scores.insert(id, SourceReport { divergence: div, contribution: div, top_events: vec![] });
     }
 
     let score = (total_div / n as f64).clamp(0.0, 1.0);
     let verdict = verdict_string(score, config.significance_threshold as f64);
     Ok(AnomalyReport {
         score,
+        uncertainty: 0.0,
         verdict,
         source_scores,
         pair_scores: vec![],
@@ -440,193 +415,6 @@ fn distributional_only(
         meta_conflict: 0.0,
         methods: vec![],
     })
-}
-
-// ---------------------------------------------------------------------------
-// Baseline stability estimation
-// ---------------------------------------------------------------------------
-
-struct Stability {
-    dist: f64,
-    dep: f64,
-    spec: f64,
-    co: f64,
-    conflict: f64,
-    wav: f64,
-}
-
-/// Split baseline into two halves, run each method on both halves, return variance proxy.
-#[cfg(not(feature = "parallel"))]
-fn baseline_stability(baseline: &LogCollection, pairs: &[SourceId]) -> Stability {
-    if pairs.is_empty() {
-        return Stability { dist: 0.0, dep: 0.0, spec: 0.0, co: 0.0, conflict: 0.0, wav: 0.0 };
-    }
-    let (half_a, half_b) = split_collection(baseline, pairs);
-    let ra = extract(&half_a);
-    let rb = extract(&half_b);
-    Stability {
-        dist: baseline_stability_dist_reps(&ra, &rb, pairs),
-        dep: baseline_stability_dep_reps(&ra, &rb),
-        spec: baseline_stability_spec_reps(&ra, &rb, pairs),
-        co: baseline_stability_co_reps(&ra, &rb, pairs),
-        conflict: baseline_stability_conflict_reps(&half_a, &half_b, pairs),
-        wav: baseline_stability_wav_reps(&ra, &rb, pairs),
-    }
-}
-
-#[cfg(feature = "parallel")]
-fn baseline_stability_dist(baseline: &LogCollection, pairs: &[SourceId]) -> f64 {
-    if pairs.is_empty() { return 0.0; }
-    let (a, b) = split_collection(baseline, pairs);
-    baseline_stability_dist_reps(&extract(&a), &extract(&b), pairs)
-}
-#[cfg(feature = "parallel")]
-fn baseline_stability_dep(baseline: &LogCollection, pairs: &[SourceId]) -> f64 {
-    if pairs.is_empty() { return 0.0; }
-    let (a, b) = split_collection(baseline, pairs);
-    baseline_stability_dep_reps(&extract(&a), &extract(&b))
-}
-#[cfg(feature = "parallel")]
-fn baseline_stability_spec(baseline: &LogCollection, pairs: &[SourceId]) -> f64 {
-    if pairs.is_empty() { return 0.0; }
-    let (a, b) = split_collection(baseline, pairs);
-    baseline_stability_spec_reps(&extract(&a), &extract(&b), pairs)
-}
-#[cfg(feature = "parallel")]
-fn baseline_stability_co(baseline: &LogCollection, pairs: &[SourceId]) -> f64 {
-    if pairs.is_empty() { return 0.0; }
-    let (a, b) = split_collection(baseline, pairs);
-    baseline_stability_co_reps(&extract(&a), &extract(&b), pairs)
-}
-
-#[cfg(feature = "parallel")]
-fn baseline_stability_conflict(baseline: &LogCollection, pairs: &[SourceId]) -> f64 {
-    if pairs.is_empty() { return 0.0; }
-    let (a, b) = split_collection(baseline, pairs);
-    baseline_stability_conflict_reps(&a, &b, pairs)
-}
-
-#[cfg(feature = "parallel")]
-fn baseline_stability_wav(baseline: &LogCollection, pairs: &[SourceId]) -> f64 {
-    if pairs.is_empty() { return 0.0; }
-    let (a, b) = split_collection(baseline, pairs);
-    baseline_stability_wav_reps(&extract(&a), &extract(&b), pairs)
-}
-
-fn baseline_stability_dist_reps(
-    ra: &extract::Representations,
-    rb: &extract::Representations,
-    pairs: &[SourceId],
-) -> f64 {
-    let divs: Vec<f64> = pairs
-        .iter()
-        .map(|id| distributional_divergence(&ra.distributions[id], &rb.distributions[id]))
-        .collect();
-    variance(&divs)
-}
-
-fn baseline_stability_dep_reps(
-    ra: &extract::Representations,
-    rb: &extract::Representations,
-) -> f64 {
-    match (&ra.mi_matrix, &rb.mi_matrix) {
-        (Some(ma), Some(mb)) => mi_matrix_divergence(ma, mb),
-        _ => 0.0,
-    }
-}
-
-fn baseline_stability_spec_reps(
-    ra: &extract::Representations,
-    rb: &extract::Representations,
-    pairs: &[SourceId],
-) -> f64 {
-    let divs: Vec<f64> = pairs
-        .iter()
-        .filter_map(|id| Some(spectral_divergence(ra.spectra.get(id)?, rb.spectra.get(id)?)))
-        .collect();
-    variance(&divs)
-}
-
-fn baseline_stability_co_reps(
-    ra: &extract::Representations,
-    rb: &extract::Representations,
-    pairs: &[SourceId],
-) -> f64 {
-    let divs: Vec<f64> = pairs
-        .iter()
-        .filter_map(|id| Some(eigen_divergence(ra.eigen.get(id)?, rb.eigen.get(id)?)))
-        .collect();
-    variance(&divs)
-}
-
-/// Conflict stability: variance of pairwise DS conflict across the two halves.
-fn baseline_stability_conflict_reps(
-    half_a: &LogCollection,
-    half_b: &LogCollection,
-    pairs: &[SourceId],
-) -> f64 {
-    // Compute per-source distributional divergence within each half vs. the other.
-    let ra = extract(half_a);
-    let rb = extract(half_b);
-    let bpas_a: Vec<BPA> = pairs
-        .iter()
-        .map(|id| evidence_bpa(distributional_divergence(&ra.distributions[id], &rb.distributions[id]), 1.0))
-        .collect();
-    let bpas_b: Vec<BPA> = pairs
-        .iter()
-        .map(|id| evidence_bpa(distributional_divergence(&rb.distributions[id], &ra.distributions[id]), 1.0))
-        .collect();
-    if bpas_a.len() < 2 { return 0.0; }
-    let conflict_a = pairwise_max_conflict(&bpas_a);
-    let conflict_b = pairwise_max_conflict(&bpas_b);
-    (conflict_a - conflict_b).powi(2)
-}
-
-fn pairwise_max_conflict(bpas: &[BPA]) -> f64 {
-    let mut max = 0.0f64;
-    for i in 0..bpas.len() {
-        for j in i + 1..bpas.len() {
-            max = max.max(analysis::ds_conflict(&bpas[i], &bpas[j]));
-        }
-    }
-    max
-}
-
-fn baseline_stability_wav_reps(
-    ra: &extract::Representations,
-    rb: &extract::Representations,
-    pairs: &[SourceId],
-) -> f64 {
-    const MIN_SPECTRAL_EVENTS: usize = 32;
-    let divs: Vec<f64> = pairs
-        .iter()
-        .filter_map(|id| {
-            if ra.spectra.get(id)?.magnitudes.len() < MIN_SPECTRAL_EVENTS { return None; }
-            Some(spectral_divergence(ra.spectra.get(id)?, rb.spectra.get(id)?))
-        })
-        .collect();
-    variance(&divs)
-}
-
-fn split_collection(
-    collection: &LogCollection,
-    pairs: &[SourceId],
-) -> (LogCollection, LogCollection) {
-    let mut a_sources = HashMap::new();
-    let mut b_sources = HashMap::new();
-
-    for &id in pairs {
-        let events = &collection.sources[&id].events;
-        let mid = events.len() / 2;
-        a_sources.insert(id, EventStream { events: events[..mid].to_vec() });
-        b_sources.insert(id, EventStream { events: events[mid..].to_vec() });
-    }
-
-    let meta = collection.metadata.clone();
-    (
-        LogCollection { sources: a_sources, metadata: meta.clone() },
-        LogCollection { sources: b_sources, metadata: meta },
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -640,52 +428,59 @@ fn source_pairs(
 ) -> Result<(Vec<SourceId>, MissingSourceReport), DetectError> {
     match mode {
         ComparisonMode::SingleOrigin => {
-            let mut baseline_only: Vec<SourceId> = baseline
-                .sources
-                .keys()
-                .filter(|id| !test.sources.contains_key(id))
-                .copied()
-                .collect();
-            let mut test_only: Vec<SourceId> = test
-                .sources
-                .keys()
-                .filter(|id| !baseline.sources.contains_key(id))
-                .copied()
-                .collect();
+            let mut baseline_only: Vec<SourceId> = baseline.sources.keys()
+                .filter(|id| !test.sources.contains_key(id)).copied().collect();
+            let mut test_only: Vec<SourceId> = test.sources.keys()
+                .filter(|id| !baseline.sources.contains_key(id)).copied().collect();
             baseline_only.sort_by_key(|s| s.0);
             test_only.sort_by_key(|s| s.0);
-            let mut pairs: Vec<SourceId> = baseline
-                .sources
-                .keys()
-                .filter(|id| test.sources.contains_key(id))
-                .copied()
-                .collect();
+            let mut pairs: Vec<SourceId> = baseline.sources.keys()
+                .filter(|id| test.sources.contains_key(id)).copied().collect();
             pairs.sort_by_key(|s| s.0);
             Ok((pairs, MissingSourceReport { baseline_only, test_only }))
         }
         ComparisonMode::MultiOrigin => {
-            let mut pairs: Vec<SourceId> = baseline
-                .sources
-                .keys()
-                .filter(|id| test.sources.contains_key(id))
-                .copied()
-                .collect();
-            if pairs.is_empty() {
-                return Err(DetectError::NoOverlappingSources);
-            }
+            let mut pairs: Vec<SourceId> = baseline.sources.keys()
+                .filter(|id| test.sources.contains_key(id)).copied().collect();
+            if pairs.is_empty() { return Err(DetectError::NoOverlappingSources); }
             pairs.sort_by_key(|s| s.0);
             Ok((pairs, MissingSourceReport { baseline_only: vec![], test_only: vec![] }))
         }
     }
 }
 
+fn compute_pair_scores(
+    b_rep: &extract::Representations,
+    t_rep: &extract::Representations,
+    pairs: &[SourceId],
+) -> Vec<PairReport> {
+    if pairs.len() < 2 { return vec![]; }
+    match (&b_rep.mi_matrix, &t_rep.mi_matrix) {
+        (Some(bm), Some(tm)) => {
+            let b_idx: HashMap<SourceId, usize> = bm.sources.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+            let t_idx: HashMap<SourceId, usize> = tm.sources.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+            let mut out = vec![];
+            for i in 0..pairs.len() {
+                for j in i + 1..pairs.len() {
+                    let (a, b) = (pairs[i], pairs[j]);
+                    let b_mi = b_idx.get(&a).and_then(|&ai| b_idx.get(&b).map(|&bi| bm.values[ai][bi])).unwrap_or(0.0);
+                    let t_mi = t_idx.get(&a).and_then(|&ai| t_idx.get(&b).map(|&bi| tm.values[ai][bi])).unwrap_or(0.0);
+                    let denom = b_mi.max(t_mi);
+                    let dep_shift = if denom < 1e-10 { 0.0 } else { (b_mi - t_mi).abs() / denom };
+                    out.push(PairReport { source_a: a, source_b: b, dependency_shift: dep_shift, baseline_correlation: b_mi, test_correlation: t_mi });
+                }
+            }
+            out
+        }
+        _ => vec![],
+    }
+}
+
 fn eigen_divergence(a: &analysis::EigenSpectrum, b: &analysis::EigenSpectrum) -> f64 {
     let len = a.eigenvalues.len().min(b.eigenvalues.len());
-    if len == 0 {
-        return 0.0;
-    }
-    let a_total: f64 = a.eigenvalues.iter().sum::<f64>().max(1e-10);
-    let b_total: f64 = b.eigenvalues.iter().sum::<f64>().max(1e-10);
+    if len == 0 { return 0.0; }
+    let a_total = a.eigenvalues.iter().sum::<f64>().max(1e-10);
+    let b_total = b.eigenvalues.iter().sum::<f64>().max(1e-10);
     let (mut kl_am, mut kl_bm) = (0.0f64, 0.0f64);
     for i in 0..len {
         let p = a.eigenvalues[i] / a_total;
@@ -697,12 +492,68 @@ fn eigen_divergence(a: &analysis::EigenSpectrum, b: &analysis::EigenSpectrum) ->
     (0.5 * (kl_am + kl_bm) / std::f64::consts::LN_2).clamp(0.0, 1.0)
 }
 
-fn variance(xs: &[f64]) -> f64 {
-    if xs.len() < 2 {
-        return 0.0;
+fn wavelet_divergence(a: &analysis::WaveletCoefficients, b: &analysis::WaveletCoefficients) -> f64 {
+    a.levels.iter().zip(b.levels.iter()).map(|(al, bl)| {
+        let ae: f64 = al.iter().map(|x| x * x).sum();
+        let be: f64 = bl.iter().map(|x| x * x).sum();
+        let denom = ae.max(be);
+        if denom < 1e-10 { 0.0 } else { (ae - be).abs() / denom }
+    }).fold(0.0f64, f64::max)
+}
+
+fn dist_entropy(rep: &extract::Representations) -> f64 {
+    mean_of(rep.distributions.values().map(|d| {
+        let t = d.total.max(1) as f64;
+        let probs: Vec<f64> = d.counts.values().map(|&c| c as f64 / t).collect();
+        shannon_entropy(&probs)
+    }))
+}
+
+fn eigen_entropy_mean(rep: &extract::Representations) -> f64 {
+    mean_of(rep.eigen.values().map(|e| {
+        let total: f64 = e.eigenvalues.iter().sum();
+        if total < 1e-10 { 0.0 } else {
+            let norm: Vec<f64> = e.eigenvalues.iter().map(|&v| v / total).collect();
+            shannon_entropy(&norm)
+        }
+    }))
+}
+
+fn wavelet_entropy_mean(rep: &extract::Representations) -> f64 {
+    mean_of(rep.wavelets.values().filter_map(|wc| {
+        let energies: Vec<f64> = wc.levels.iter().map(|l| l.iter().map(|x| x * x).sum::<f64>()).collect();
+        let total: f64 = energies.iter().sum();
+        if total < 1e-10 { return None; }
+        let norm: Vec<f64> = energies.iter().map(|&e| e / total).collect();
+        Some(shannon_entropy(&norm))
+    }))
+}
+
+fn pairwise_max_conflict(bpas: &[BPA]) -> f64 {
+    let mut max = 0.0f64;
+    for i in 0..bpas.len() {
+        for j in i + 1..bpas.len() {
+            max = max.max(analysis::ds_conflict(&bpas[i], &bpas[j]));
+        }
     }
-    let mean = xs.iter().sum::<f64>() / xs.len() as f64;
-    xs.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / xs.len() as f64
+    max
+}
+
+fn zscore(observation: f64, mean: f64, variance: f64) -> f64 {
+    let sigma = variance.sqrt();
+    if sigma < 1e-10 { 0.0 } else { (observation - mean) / sigma }
+}
+
+fn mean_of(iter: impl Iterator<Item = f64>) -> f64 {
+    let (sum, count) = iter.fold((0.0f64, 0usize), |(s, c), v| (s + v, c + 1));
+    if count == 0 { 0.0 } else { sum / count as f64 }
+}
+
+fn mean_arr(xs: &[f64; 3]) -> f64 { (xs[0] + xs[1] + xs[2]) / 3.0 }
+
+fn variance_arr(xs: &[f64; 3]) -> f64 {
+    let m = mean_arr(xs);
+    ((xs[0] - m).powi(2) + (xs[1] - m).powi(2) + (xs[2] - m).powi(2)) / 3.0
 }
 
 fn verdict_string(score: f64, _threshold: f64) -> String {

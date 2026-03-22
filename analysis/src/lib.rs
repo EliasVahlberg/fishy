@@ -29,7 +29,7 @@ pub use spectral::{spectral_divergence, spectral_fingerprint, wavelet_decompose}
 
 // --- Evidence ---
 
-pub use evidence::evidence_bpa;
+pub use evidence::{bpa_from_zscore, evidence_bpa};
 
 // --- Co-occurrence ---
 
