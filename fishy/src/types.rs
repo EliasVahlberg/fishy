@@ -76,6 +76,18 @@ pub struct AnomalyReport {
     pub missing_sources: MissingSourceReport,
     /// Degree of disagreement between analysis methods (DS conflict mass).
     pub meta_conflict: f64,
+    /// Per-method breakdown from the adaptive fusion pass.
+    pub methods: Vec<MethodDetail>,
+}
+
+/// Per-method detail from the adaptive fusion pass.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MethodDetail {
+    pub name: String,
+    pub divergence: f64,
+    pub perceived_entropy: f64,
+    pub baseline_stability: f64,
+    pub weight: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

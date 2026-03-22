@@ -1,7 +1,7 @@
 use crate::types::{EventStream, LogCollection, SourceId};
 use analysis::{
-    co_occurrence_spectrum, mutual_information_matrix, spectral_fingerprint, EventDistribution,
-    EigenSpectrum, MIMatrix, PowerSpectrum, TemplateId,
+    co_occurrence_spectrum, mutual_information_matrix_timed, spectral_fingerprint,
+    EventDistribution, EigenSpectrum, MIMatrix, PowerSpectrum, TemplateId,
 };
 use std::collections::HashMap;
 
@@ -20,12 +20,25 @@ pub struct Representations {
     pub mi_sources: Vec<SourceId>,
 }
 
-/// Bin width for spectral analysis (seconds).
-pub const BIN_WIDTH: u64 = 60;
-/// Co-occurrence window (seconds).
-pub const CO_WINDOW: u64 = 30;
+/// Bin width for spectral analysis — scales with collection duration.
+/// Targets ~1024 bins: duration / 1024, clamped to [1s, 1h].
+pub fn adaptive_bin_width(duration_secs: u64) -> u64 {
+    (duration_secs / 1024).clamp(1, 3600)
+}
+
+/// Co-occurrence window — 1/10 of bin width, minimum 1s.
+pub fn adaptive_co_window(bin_width: u64) -> u64 {
+    (bin_width / 10).max(1)
+}
 
 pub fn extract(collection: &LogCollection) -> Representations {
+    let duration = collection.metadata.end_time.saturating_sub(collection.metadata.start_time);
+    let bin_width = adaptive_bin_width(duration);
+    let co_window = adaptive_co_window(bin_width);
+    extract_with(collection, bin_width, co_window)
+}
+
+pub fn extract_with(collection: &LogCollection, bin_width: u64, co_window: u64) -> Representations {
     let mut sources: Vec<SourceId> = collection.sources.keys().copied().collect();
     sources.sort_by_key(|s| s.0);
 
@@ -38,7 +51,7 @@ pub fn extract(collection: &LogCollection) -> Representations {
         .iter()
         .map(|&id| {
             let times = event_times(&collection.sources[&id]);
-            (id, spectral_fingerprint(&times, BIN_WIDTH))
+            (id, spectral_fingerprint(&times, bin_width))
         })
         .collect();
 
@@ -46,18 +59,18 @@ pub fn extract(collection: &LogCollection) -> Representations {
         .iter()
         .map(|&id| {
             let events = timed_events(&collection.sources[&id]);
-            (id, co_occurrence_spectrum(&events, CO_WINDOW))
+            (id, co_occurrence_spectrum(&events, co_window))
         })
         .collect();
 
     let (mi_matrix, mi_sources) = if sources.len() >= 2 {
-        let cols: Vec<Vec<TemplateId>> = sources
+        let timed: Vec<Vec<(TemplateId, u64)>> = sources
             .iter()
-            .map(|id| collection.sources[id].events.iter().map(|e| e.template_id).collect())
+            .map(|id| timed_events(&collection.sources[id]))
             .collect();
-        let col_refs: Vec<(SourceId, &[TemplateId])> =
-            sources.iter().zip(cols.iter()).map(|(&id, v)| (id, v.as_slice())).collect();
-        let m = mutual_information_matrix(&col_refs);
+        let col_refs: Vec<(SourceId, &[(TemplateId, u64)])> =
+            sources.iter().zip(timed.iter()).map(|(&id, v)| (id, v.as_slice())).collect();
+        let m = mutual_information_matrix_timed(&col_refs, bin_width);
         (Some(m), sources.clone())
     } else {
         (None, vec![])

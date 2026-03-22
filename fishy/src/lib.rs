@@ -17,9 +17,9 @@ pub use types::*;
 
 use analysis::{
     distributional_divergence, evidence_bpa, matrix_entropy, mi_matrix_divergence,
-    shannon_entropy, spectral_divergence, spectral_entropy, BPA,
+    shannon_entropy, spectral_divergence, spectral_entropy, wavelet_decompose, BPA,
 };
-use extract::{extract, to_distribution};
+use extract::{adaptive_bin_width, extract, to_distribution};
 use std::collections::HashMap;
 
 pub fn detect(
@@ -36,8 +36,8 @@ pub fn detect(
     let tol = config.duration_tolerance as f64;
     // tol == 0.0 disables the temporal check entirely.
     if tol > 0.0 && b_dur > 0 && t_dur > 0 {
-        let ratio = b_dur as f64 / t_dur as f64;
-        if ratio < (1.0 - tol) || ratio > (1.0 + tol) {
+        let ratio = b_dur.max(t_dur) as f64 / b_dur.min(t_dur) as f64;
+        if ratio > (1.0 + tol) {
             return Err(DetectError::TemporalMismatch {
                 baseline_duration: b_dur,
                 test_duration: t_dur,
@@ -110,6 +110,9 @@ fn adaptive(
     // Minimum events required for frequency-domain methods to be meaningful.
     const MIN_SPECTRAL_EVENTS: usize = 32;
 
+    let b_dur = baseline.metadata.end_time.saturating_sub(baseline.metadata.start_time);
+    let bin_width = adaptive_bin_width(b_dur);
+
     // 3. Spectral: max spectral divergence across paired sources.
     let spec_div = pairs
         .iter()
@@ -159,6 +162,29 @@ fn adaptive(
         }
     };
 
+    // 6. Wavelet: max detail-level energy divergence across paired sources.
+    let wav_div = pairs
+        .iter()
+        .filter_map(|id| {
+            let stream = baseline.sources.get(id)?;
+            if stream.events.len() < MIN_SPECTRAL_EVENTS {
+                return None;
+            }
+            let b_times = extract::event_times(&baseline.sources[id]);
+            let t_times = extract::event_times(&test.sources[id]);
+            let bw = wavelet_decompose(&b_times, bin_width, 4);
+            let tw = wavelet_decompose(&t_times, bin_width, 4);
+            // Compare energy at each detail level; take max divergence across levels.
+            let div = bw.levels.iter().zip(tw.levels.iter()).map(|(bl, tl)| {
+                let b_e: f64 = bl.iter().map(|x| x * x).sum();
+                let t_e: f64 = tl.iter().map(|x| x * x).sum();
+                let denom = b_e.max(t_e);
+                if denom < 1e-10 { 0.0 } else { (b_e - t_e).abs() / denom }
+            }).fold(0.0f64, f64::max);
+            Some(div)
+        })
+        .fold(0.0f64, f64::max);
+
     // --- Perceived entropy per method (from baseline) ---
     let dist_entropy = {
         let all_counts: Vec<f64> = b_rep
@@ -207,6 +233,27 @@ fn adaptive(
         }
     };
 
+    // Wavelet entropy: mean energy distribution entropy across detail levels.
+    let wav_entropy = {
+        let vals: Vec<f64> = pairs
+            .iter()
+            .filter_map(|id| {
+                let stream = baseline.sources.get(id)?;
+                if stream.events.len() < MIN_SPECTRAL_EVENTS { return None; }
+                let times = extract::event_times(stream);
+                let wc = wavelet_decompose(&times, bin_width, 4);
+                let energies: Vec<f64> = wc.levels.iter()
+                    .map(|l| l.iter().map(|x| x * x).sum::<f64>())
+                    .collect();
+                let total: f64 = energies.iter().sum();
+                if total < 1e-10 { return None; }
+                let norm: Vec<f64> = energies.iter().map(|&e| e / total).collect();
+                Some(shannon_entropy(&norm))
+            })
+            .collect();
+        if vals.is_empty() { 0.0 } else { vals.iter().sum::<f64>() / vals.len() as f64 }
+    };
+
     // --- Baseline stability (sub-sample variance) — most expensive step ---
     #[cfg(feature = "parallel")]
     let b_stability = {
@@ -229,11 +276,12 @@ fn adaptive(
 
     // --- Weights: entropy × 1/(1+variance) ---
     let methods: &[(&str, f64, f64, f64)] = &[
-        ("dist", dist_div, dist_entropy, b_stability.dist),
-        ("dep", dep_div, dep_entropy, b_stability.dep),
-        ("spec", spec_div, spec_entropy, b_stability.spec),
-        ("co", co_div, co_entropy, b_stability.co),
+        ("dist",     dist_div,     dist_entropy,     b_stability.dist),
+        ("dep",      dep_div,      dep_entropy,      b_stability.dep),
+        ("spec",     spec_div,     spec_entropy,     b_stability.spec),
+        ("co",       co_div,       co_entropy,       b_stability.co),
         ("conflict", conflict_div, conflict_entropy, b_stability.conflict),
+        ("wavelet",  wav_div,      wav_entropy,      0.0),
     ];
 
     let weights: Vec<f64> = methods
@@ -279,15 +327,62 @@ fn adaptive(
         report.contribution = report.divergence * score;
     }
 
+    // Populate pair_scores from MI matrix diagonal entries.
+    let pair_scores: Vec<PairReport> = if pairs.len() >= 2 {
+        match (&b_rep.mi_matrix, &t_rep.mi_matrix) {
+            (Some(bm), Some(tm)) => {
+                let b_idx: HashMap<SourceId, usize> =
+                    bm.sources.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+                let t_idx: HashMap<SourceId, usize> =
+                    tm.sources.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+                let mut out = vec![];
+                for i in 0..pairs.len() {
+                    for j in i + 1..pairs.len() {
+                        let a = pairs[i];
+                        let b = pairs[j];
+                        let b_mi = b_idx.get(&a).and_then(|&ai| b_idx.get(&b).map(|&bi| bm.values[ai][bi])).unwrap_or(0.0);
+                        let t_mi = t_idx.get(&a).and_then(|&ai| t_idx.get(&b).map(|&bi| tm.values[ai][bi])).unwrap_or(0.0);
+                        let denom = b_mi.max(t_mi);
+                        let dep_shift = if denom < 1e-10 { 0.0 } else { (b_mi - t_mi).abs() / denom };
+                        out.push(PairReport {
+                            source_a: a,
+                            source_b: b,
+                            dependency_shift: dep_shift,
+                            baseline_correlation: b_mi,
+                            test_correlation: t_mi,
+                        });
+                    }
+                }
+                out
+            }
+            _ => vec![],
+        }
+    } else {
+        vec![]
+    };
+
     let verdict = verdict_string(score, config.significance_threshold as f64);
+
+    let method_details: Vec<MethodDetail> = methods
+        .iter()
+        .zip(weights.iter())
+        .map(|((name, div, entropy, variance), &w)| MethodDetail {
+            name: name.to_string(),
+            divergence: *div,
+            perceived_entropy: *entropy,
+            baseline_stability: *variance,
+            weight: w,
+        })
+        .collect();
 
     Ok(AnomalyReport {
         score,
         verdict,
         source_scores,
-        pair_scores: vec![],
+        pair_scores,
         missing_sources: missing.clone(),
         meta_conflict,
+        methods: method_details,
     })
 }
 
@@ -333,6 +428,7 @@ fn distributional_only(
         pair_scores: vec![],
         missing_sources: missing.clone(),
         meta_conflict: 0.0,
+        methods: vec![],
     })
 }
 
@@ -534,10 +630,13 @@ fn variance(xs: &[f64]) -> f64 {
     xs.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / xs.len() as f64
 }
 
-fn verdict_string(score: f64, threshold: f64) -> String {
-    if score >= threshold {
-        format!("fishy score: {score:.2} — something smells off")
-    } else {
-        format!("fishy score: {score:.2} — looks normal")
-    }
+fn verdict_string(score: f64, _threshold: f64) -> String {
+    let tier = match score {
+        s if s < 0.20 => "looks clean",
+        s if s < 0.40 => "probably fine",
+        s if s < 0.60 => "worth a look",
+        s if s < 0.80 => "something smells off",
+        _             => "definitely fishy",
+    };
+    format!("fishy score: {score:.2} — {tier}")
 }

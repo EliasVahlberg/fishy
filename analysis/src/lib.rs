@@ -21,7 +21,7 @@ pub use distributional::distributional_divergence;
 
 // --- Dependency ---
 
-pub use dependency::{mi_matrix_divergence, mutual_information_matrix};
+pub use dependency::{mi_matrix_divergence, mutual_information_matrix, mutual_information_matrix_timed};
 
 // --- Spectral ---
 

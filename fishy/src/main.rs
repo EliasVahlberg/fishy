@@ -60,6 +60,7 @@ fn main() {
 
     match fishy::detect(&baseline, &test, &config) {
         Ok(report) => {
+            let anomalous = report.score >= cli.threshold as f64;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&report).unwrap());
             } else {
@@ -68,10 +69,13 @@ fn main() {
                     print_verbose(&report);
                 }
             }
+            if anomalous {
+                std::process::exit(1);
+            }
         }
         Err(e) => {
             eprintln!("error: {e}");
-            std::process::exit(1);
+            std::process::exit(2);
         }
     }
 }
@@ -79,6 +83,18 @@ fn main() {
 fn print_verbose(report: &AnomalyReport) {
     if report.meta_conflict > 0.05 {
         println!("  meta-conflict: {:.2} (methods disagree)", report.meta_conflict);
+    }
+
+    if !report.methods.is_empty() {
+        println!("  methods:");
+        let w_sum: f64 = report.methods.iter().map(|m| m.weight).sum();
+        for m in &report.methods {
+            let pct = if w_sum > 1e-10 { m.weight / w_sum * 100.0 } else { 0.0 };
+            println!(
+                "    {:>10}: div={:.2}  entropy={:.2}  stability={:.2}  weight={:.1}%",
+                m.name, m.divergence, m.perceived_entropy, m.baseline_stability, pct
+            );
+        }
     }
 
     let mut sources: Vec<_> = report.source_scores.iter().collect();

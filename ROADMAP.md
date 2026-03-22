@@ -47,3 +47,13 @@ After this milestone: fishy is the actual product.
 - [x] Multi-origin mode (overlapping sources only)
 - [x] Rayon parallelism behind `parallel` feature flag
 - [x] Applicability guards (skip dependency shift if <2 sources, skip spectral/co-occurrence if <32 events)
+
+## Milestone 6 — Encoder ✅
+> Tokenise raw log files into fishy's on-disk format.
+
+- [x] `Dictionary` — frequency-ranked template IDs (most frequent → `TemplateId(1)`, `TemplateId(0)` reserved for unknown)
+- [x] `LogFormat` — `NginxAccess`, `Syslog`, `Json`, `Custom`, `Bgl`
+- [x] Sticky timestamps — events inherit the last seen timestamp until a new one appears
+- [x] `build-dict` CLI subcommand — two-pass frequency count → rank
+- [x] `encode` CLI subcommand — writes `<source_id>.json` + `meta.json` per collection
+- [x] BGL dataset support — label-based baseline/test split, per-rack sources
