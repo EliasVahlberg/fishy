@@ -96,3 +96,25 @@ After this milestone: fishy is the actual product.
 - [x] Per-method sigmoid midpoints — wavelet 3.0, spec 2.5, others 2.0 (reduces day_0 FP from 0.86→0.74)
 - [x] `source_weights` wired into dist divergence (weighted mean when provided)
 - [x] `FusionStrategy` single-method modes — DistributionalFingerprint, DependencyShift, SpectralFingerprint, EvidenceConflict each run only their target method through adaptive pipeline
+
+## Milestone 11 — Extended Dataset Evaluation
+> Cross-validate fishy on additional labeled datasets to confirm generalization.
+
+### AIT-LDSv2 additional scenarios (same Zenodo record, `prep_ait.py` already supports all 8)
+
+- [ ] **santos** (10 GB zip, 17 GB unpacked) — 4-day sim, low scan volume, 44-min attack. Smallest after russellmitchell.
+- [ ] **fox** (15.8 GB zip, 26 GB unpacked) — 5-day sim, high scan volume, 76-min attack. Tests high-noise detection.
+- [ ] **wheeler** (19.6 GB zip, 30 GB unpacked) — 5-day sim, high scan volume, 10h attack window, no password cracking. Longest attack — tests sustained anomaly detection.
+
+### Thunderbird (CFDR supercomputer logs)
+
+- [ ] Download Thunderbird dataset (~30 GB) from CFDR
+- [ ] Preprocessing script — per-rack sources (like BGL), label-based baseline/test split
+- [ ] Run fishy and record results — validates BGL findings generalize to a second supercomputer
+
+### Success criteria
+
+Same as M8:
+- baseline vs baseline → score < 0.3
+- normal vs normal (adjacent days) → score < 0.3
+- normal vs attack → score > 0.7
