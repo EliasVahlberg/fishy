@@ -102,7 +102,7 @@ After this milestone: fishy is the actual product.
 
 ### AIT-LDSv2 additional scenarios (same Zenodo record, `prep_ait.py` already supports all 8)
 
-- [ ] **santos** (10 GB zip, 17 GB unpacked) — 4-day sim, low scan volume, 44-min attack. Smallest after russellmitchell.
+- [x] **santos** (10 GB zip, 17 GB unpacked) — 4-day sim, low scan volume, 44-min attack. Smallest after russellmitchell.
 - [ ] **fox** (15.8 GB zip, 26 GB unpacked) — 5-day sim, high scan volume, 76-min attack. Tests high-noise detection.
 - [ ] **wheeler** (19.6 GB zip, 30 GB unpacked) — 5-day sim, high scan volume, 10h attack window, no password cracking. Longest attack — tests sustained anomaly detection.
 
