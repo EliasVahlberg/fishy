@@ -5,9 +5,9 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "fishy", about = "Multi-source anomaly detection")]
 struct Cli {
-    /// Baseline collection directory
-    #[arg(short, long)]
-    baseline: PathBuf,
+    /// Baseline collection directory (repeat for multiple baselines)
+    #[arg(short, long, num_args = 1..)]
+    baseline: Vec<PathBuf>,
 
     /// Test collection directory to compare against baseline
     #[arg(short = 'c', long)]
@@ -37,10 +37,18 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    let baseline = load_collection(&cli.baseline).unwrap_or_else(|e| {
-        eprintln!("error loading baseline: {e}");
-        std::process::exit(1);
-    });
+    if cli.baseline.is_empty() {
+        eprintln!("error: at least one -b baseline directory required");
+        std::process::exit(2);
+    }
+
+    let baselines: Vec<_> = cli.baseline.iter().map(|p| {
+        load_collection(p).unwrap_or_else(|e| {
+            eprintln!("error loading baseline {}: {e}", p.display());
+            std::process::exit(1);
+        })
+    }).collect();
+
     let test = load_collection(&cli.compare).unwrap_or_else(|e| {
         eprintln!("error loading test collection: {e}");
         std::process::exit(1);
@@ -58,7 +66,7 @@ fn main() {
         ..DetectConfig::default()
     };
 
-    match fishy::detect(&baseline, &test, &config) {
+    match fishy::detect(&baselines, &test, &config) {
         Ok(report) => {
             let anomalous = report.score >= cli.threshold as f64;
             if cli.json {
@@ -82,6 +90,11 @@ fn main() {
 
 fn print_verbose(report: &AnomalyReport) {
     println!("  uncertainty: {:.2}", report.uncertainty);
+    println!("  baselines: {} used", report.baseline_count);
+    if !report.rejected_baselines.is_empty() {
+        let ids: Vec<_> = report.rejected_baselines.iter().map(|i| i.to_string()).collect();
+        println!("  rejected baselines (outliers): {}", ids.join(", "));
+    }
     if report.meta_conflict > 0.05 {
         println!("  meta-conflict: {:.2} (methods disagree)", report.meta_conflict);
     }
@@ -90,9 +103,18 @@ fn print_verbose(report: &AnomalyReport) {
         println!("  methods:");
         for m in &report.methods {
             if m.applicable {
+                let pct_str = match m.divergence_percentile {
+                    Some(p) => format!("  pct={:.2}", p),
+                    None => String::new(),
+                };
+                let trend_str = match m.trend_z {
+                    Some(z) if z.abs() > 2.0 => format!("  trend_z={:+.1}", z),
+                    _ => String::new(),
+                };
                 println!(
-                    "    {:>10}: div={:.2}  ΔH={:+.3}  z_d={:+.1}  z_ΔH={:+.1}  H_b={:.2}",
-                    m.name, m.divergence, m.entropy_delta, m.z_divergence, m.z_entropy_delta, m.baseline_entropy
+                    "    {:>10}: div={:.2}  ΔH={:+.3}  z_d={:+.1}  z_ΔH={:+.1}  H_b={:.2}{}{}",
+                    m.name, m.divergence, m.entropy_delta, m.z_divergence, m.z_entropy_delta,
+                    m.baseline_entropy, pct_str, trend_str
                 );
             } else {
                 println!("    {:>10}: (skipped — not applicable)", m.name);

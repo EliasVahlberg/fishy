@@ -1,7 +1,11 @@
 //! Multi-source information-fusion anomaly detection through collection comparison.
 //!
 //! ```ignore
-//! let report = fishy::detect(&baseline, &test, &DetectConfig::default())?;
+//! // Single baseline (legacy — z-score path, quarter-split variance):
+//! let report = fishy::detect(&[baseline], &test, &DetectConfig::default())?;
+//!
+//! // Multi-baseline (recommended — empirical CDF, pairwise variance):
+//! let report = fishy::detect(&[day1, day2, day3], &test, &DetectConfig::default())?;
 //! println!("fishy score: {:.2}", report.score);
 //! ```
 
@@ -20,35 +24,31 @@ use analysis::{
     mi_matrix_divergence, shannon_entropy, spectral_divergence, spectral_entropy, BPA,
     BpaMapping,
 };
+
+/// Sigmoid midpoints used when fewer than 3 pairwise baseline samples are available.
+const METHOD_MIDPOINTS: [f64; 6] = [2.0, 2.0, 2.5, 2.0, 2.0, 3.0];
 use extract::extract;
 use std::collections::HashMap;
 
 const METHODS: [&str; 6] = ["dist", "dep", "spec", "co", "conflict", "wavelet"];
-/// Per-method sigmoid midpoints for z-score → belief conversion.
-/// Higher midpoint = less sensitive (requires larger z to reach 50% commitment).
-/// Wavelet is noisiest (fires on day-to-day temporal drift), so gets 3.0.
-const METHOD_MIDPOINTS: [f64; 6] = [
-    2.0, // dist — reliable, low between-collection noise
-    2.0, // dep
-    2.5, // spec — moderate temporal sensitivity
-    2.0, // co
-    2.0, // conflict
-    3.0, // wavelet — high between-collection variance (AIT day_0 FP driver)
-];
 const MIN_SPECTRAL_EVENTS: usize = 32;
 const GATE_LOW: f64 = 0.05;
 const GATE_HIGH: f64 = 0.95;
 
 pub fn detect(
-    baseline: &LogCollection,
+    baselines: &[LogCollection],
     test: &LogCollection,
     config: &DetectConfig,
 ) -> Result<AnomalyReport, DetectError> {
-    if baseline.sources.is_empty() || test.sources.is_empty() {
+    if baselines.is_empty() {
+        return Err(DetectError::EmptyCollection);
+    }
+    if test.sources.is_empty() {
         return Err(DetectError::EmptyCollection);
     }
 
-    let b_dur = baseline.metadata.end_time.saturating_sub(baseline.metadata.start_time);
+    // Temporal validation against first baseline
+    let b_dur = baselines[0].metadata.end_time.saturating_sub(baselines[0].metadata.start_time);
     let t_dur = test.metadata.end_time.saturating_sub(test.metadata.start_time);
     let tol = config.duration_tolerance as f64;
     if tol > 0.0 && b_dur > 0 && t_dur > 0 {
@@ -61,41 +61,35 @@ pub fn detect(
         }
     }
 
-    let (pairs, missing) = source_pairs(baseline, test, &config.mode)?;
+    // Source pairs: intersection across all baselines and test
+    let (pairs, missing) = multi_source_pairs(baselines, test, &config.mode)?;
 
     match config.strategy {
-        FusionStrategy::Adaptive => adaptive(baseline, test, &pairs, &missing, config),
+        FusionStrategy::Adaptive => adaptive(baselines, test, &pairs, &missing, config),
         FusionStrategy::DistributionalFingerprint => {
-            adaptive_single(baseline, test, &pairs, &missing, config, 0)
+            adaptive_single(baselines, test, &pairs, &missing, config, 0)
         }
         FusionStrategy::DependencyShift => {
-            adaptive_single(baseline, test, &pairs, &missing, config, 1)
+            adaptive_single(baselines, test, &pairs, &missing, config, 1)
         }
         FusionStrategy::SpectralFingerprint => {
-            adaptive_single(baseline, test, &pairs, &missing, config, 2)
+            adaptive_single(baselines, test, &pairs, &missing, config, 2)
         }
         FusionStrategy::EvidenceConflict => {
-            adaptive_single(baseline, test, &pairs, &missing, config, 4)
+            adaptive_single(baselines, test, &pairs, &missing, config, 4)
         }
     }
 }
 
-/// Single-method mode: runs the full adaptive pipeline but only produces BPAs
-/// from the specified method index.
 fn adaptive_single(
-    baseline: &LogCollection,
+    baselines: &[LogCollection],
     test: &LogCollection,
     pairs: &[SourceId],
     missing: &MissingSourceReport,
     config: &DetectConfig,
     method_idx: usize,
 ) -> Result<AnomalyReport, DetectError> {
-    // Override applicable to only include the target method
-    let mut cfg = config.clone();
-    cfg.strategy = FusionStrategy::Adaptive;
-    // We'll call adaptive directly and filter — but simpler to just mask.
-    // Re-use adaptive internals inline:
-    adaptive_inner(baseline, test, pairs, missing, &cfg, Some(method_idx))
+    adaptive_inner(baselines, test, pairs, missing, config, Some(method_idx))
 }
 
 // ---------------------------------------------------------------------------
@@ -103,73 +97,137 @@ fn adaptive_single(
 // ---------------------------------------------------------------------------
 
 fn adaptive(
-    baseline: &LogCollection,
+    baselines: &[LogCollection],
     test: &LogCollection,
     pairs: &[SourceId],
     missing: &MissingSourceReport,
     config: &DetectConfig,
 ) -> Result<AnomalyReport, DetectError> {
-    adaptive_inner(baseline, test, pairs, missing, config, None)
+    adaptive_inner(baselines, test, pairs, missing, config, None)
 }
 
 fn adaptive_inner(
-    baseline: &LogCollection,
+    baselines: &[LogCollection],
     test: &LogCollection,
     pairs: &[SourceId],
     missing: &MissingSourceReport,
     config: &DetectConfig,
     only_method: Option<usize>,
 ) -> Result<AnomalyReport, DetectError> {
+    // Use first non-rejected baseline as reference for entropy gating and source scores
+    let (rejected, active_baselines) = reject_outlier_baselines(baselines, pairs);
+    let baseline = &active_baselines[0];
     // 1. Extract representations
     #[cfg(feature = "parallel")]
     let (b_rep, t_rep) = join(|| extract(baseline), || extract(test));
     #[cfg(not(feature = "parallel"))]
     let (b_rep, t_rep) = (extract(baseline), extract(test));
 
-    // 2. Per-source distributional divergences
+    // 3. Baseline entropy + applicability gate (from reference baseline)
+    let b_entropies = method_entropies(&b_rep, pairs);
+    let max_entropies = method_max_entropies(&b_rep, pairs);
+    let applicable: [bool; 6] = std::array::from_fn(|i| {
+        if let Some(m) = only_method { if i != m { return false; } }
+        if i == 4 { return pairs.len() >= 2; }
+        let norm = if max_entropies[i] > 1e-10 { b_entropies[i] / max_entropies[i] } else { 0.0 };
+        norm > GATE_LOW && norm < GATE_HIGH && has_enough_events(i, baseline, pairs)
+    });
+
+    // 4. Method divergences: minimum test-to-baseline divergence per method.
+    // Using the minimum means: if the test is close to ANY baseline, it's not anomalous.
+    let observations: [(f64, f64); 6] = {
+        let mut min_obs: [(f64, f64); 6] = [(f64::MAX, f64::MAX); 6];
+        for b in &active_baselines {
+            let b_rep_i = extract(b);
+            let b_source_scores: HashMap<SourceId, SourceReport> = {
+                let mut ss = HashMap::new();
+                for &id in &missing.baseline_only {
+                    ss.insert(id, SourceReport { divergence: 1.0, contribution: 1.0, top_events: vec![] });
+                }
+                for &id in pairs {
+                    if b_rep_i.distributions.contains_key(&id) && t_rep.distributions.contains_key(&id) {
+                        let div = distributional_divergence(&b_rep_i.distributions[&id], &t_rep.distributions[&id]);
+                        let top_events = extract::jsd_contributions(&b_rep_i.distributions[&id], &t_rep.distributions[&id])
+                            .into_iter().take(10).collect();
+                        ss.insert(id, SourceReport { divergence: div, contribution: 0.0, top_events });
+                    }
+                }
+                ss
+            };
+            let obs = method_divergences_and_deltas(&b_rep_i, &t_rep, pairs, &b_source_scores, &config.source_weights);
+            for m in 0..6 {
+                if obs[m].0 < min_obs[m].0 {
+                    min_obs[m] = obs[m];
+                }
+            }
+        }
+        // Replace MAX sentinels with 0 for methods with no valid comparison
+        std::array::from_fn(|m| if min_obs[m].0 == f64::MAX { (0.0, 0.0) } else { min_obs[m] })
+    };
+
+    // Source scores from reference baseline (first active) for reporting
     let mut source_scores: HashMap<SourceId, SourceReport> = HashMap::new();
     for &id in &missing.baseline_only {
         source_scores.insert(id, SourceReport { divergence: 1.0, contribution: 1.0, top_events: vec![] });
     }
     for &id in pairs {
-        let div = distributional_divergence(&b_rep.distributions[&id], &t_rep.distributions[&id]);
-        let top_events = extract::jsd_contributions(&b_rep.distributions[&id], &t_rep.distributions[&id])
-            .into_iter().take(10).collect();
-        source_scores.insert(id, SourceReport { divergence: div, contribution: 0.0, top_events });
+        if b_rep.distributions.contains_key(&id) && t_rep.distributions.contains_key(&id) {
+            let div = distributional_divergence(&b_rep.distributions[&id], &t_rep.distributions[&id]);
+            let top_events = extract::jsd_contributions(&b_rep.distributions[&id], &t_rep.distributions[&id])
+                .into_iter().take(10).collect();
+            source_scores.insert(id, SourceReport { divergence: div, contribution: 0.0, top_events });
+        }
     }
 
-    // 3. Baseline entropy + applicability gate
-    let b_entropies = method_entropies(&b_rep, pairs);
-    let max_entropies = method_max_entropies(&b_rep, pairs);
-    let applicable: [bool; 6] = std::array::from_fn(|i| {
-        if let Some(m) = only_method { if i != m { return false; } }
-        if i == 4 { return pairs.len() >= 2; } // conflict: gate on source count only
-        let norm = if max_entropies[i] > 1e-10 { b_entropies[i] / max_entropies[i] } else { 0.0 };
-        norm > GATE_LOW && norm < GATE_HIGH && has_enough_events(i, baseline, pairs)
-    });
+    // 5. Baseline variance: pairwise (≥3 baselines → ≥3 samples) or quarter-split fallback.
+    // Empirical CDF requires ≥3 samples to be meaningful; 2 baselines gives only 1 pair.
+    let (div_samples, dh_samples): ([Vec<f64>; 6], [Vec<f64>; 6]) =
+        if active_baselines.len() >= 3 {
+            pairwise_baseline_stats(&active_baselines, pairs)
+        } else {
+            // 1-2 baselines: quarter-split of first baseline. Encode as [mean, std] (len=2)
+            // so the sigmoid fallback path is triggered in the BPA loop.
+            let stats = multi_split_baseline_stats(baseline, pairs);
+            (
+                std::array::from_fn(|i| vec![stats[i].0, stats[i].1.sqrt()]),
+                std::array::from_fn(|i| vec![stats[i].2, stats[i].3.sqrt()]),
+            )
+        };
 
-    // 4. Method divergences + entropy deltas (baseline vs test)
-    let observations = method_divergences_and_deltas(&b_rep, &t_rep, pairs, &source_scores, &config.source_weights);
+    // 6. Trend signals (only meaningful with ≥3 ordered baselines)
+    let trend_zs = if active_baselines.len() >= 3 {
+        trend_signals(&active_baselines, test, pairs)
+    } else {
+        [None; 6]
+    };
 
-    // 5. Multi-split baseline statistics (σ²_d + σ²_ΔH)
-    let stats = multi_split_baseline_stats(baseline, pairs);
-
-    // 6. Z-scores → BPAs → DS combination (per-method midpoints)
+    // 7. BPA construction: empirical CDF (≥3 samples) or sigmoid fallback
     let mut bpas = Vec::new();
     let mut details = Vec::new();
 
     for i in 0..6 {
-        let mapping = BpaMapping::Sigmoid { midpoint: METHOD_MIDPOINTS[i] };
         let (div, dh) = observations[i];
-        let (z_d, z_dh) = if applicable[i] {
-            let zd = zscore(div, stats[i].0, stats[i].1);
-            let zdh = zscore(dh.abs(), stats[i].2, stats[i].3);
-            // Only positive z-scores produce evidence; below-baseline = uncertain
-            if zd > 0.0 { bpas.push(bpa_from_zscore(zd, &mapping)); }
-            if i != 4 && zdh > 0.0 { bpas.push(bpa_from_zscore(zdh, &mapping)); }
-            (zd, zdh)
+        let (z_d, z_dh, pct_d, pct_dh) = if applicable[i] {
+            let (mean_d, var_d, mean_dh, var_dh) = mean_var(&div_samples[i], &dh_samples[i]);
+            let zd = zscore(div, mean_d, var_d);
+            let zdh = zscore(dh.abs(), mean_dh, var_dh);
+
+            if div_samples[i].len() >= 3 {
+                // Empirical CDF path — both divergence and ΔH are reliable
+                let pd = empirical_commitment(&div_samples[i], div);
+                let pdh = empirical_commitment(&dh_samples[i], dh.abs());
+                if pd > 0.5 { bpas.push(BPA { anomalous: pd, normal: 0.0, uncertain: 1.0 - pd }); }
+                if i != 4 && pdh > 0.5 { bpas.push(BPA { anomalous: pdh, normal: 0.0, uncertain: 1.0 - pdh }); }
+                (zd, zdh, Some(pd), Some(pdh))
+            } else {
+                // Sigmoid fallback — skip ΔH BPAs (within-collection variance underestimates
+                // between-collection entropy variance, causing false positives)
+                let mapping = BpaMapping::Sigmoid { midpoint: METHOD_MIDPOINTS[i] };
+                if zd > 0.0 { bpas.push(bpa_from_zscore(zd, &mapping)); }
+                (zd, zdh, None, None)
+            }
         } else {
-            (0.0, 0.0)
+            (0.0, 0.0, None, None)
         };
 
         details.push(MethodDetail {
@@ -178,8 +236,11 @@ fn adaptive_inner(
             divergence: div,
             entropy_delta: dh,
             baseline_entropy: b_entropies[i],
+            divergence_percentile: pct_d,
+            entropy_delta_percentile: pct_dh,
             z_divergence: z_d,
             z_entropy_delta: z_dh,
+            trend_z: trend_zs[i],
         });
     }
 
@@ -221,6 +282,8 @@ fn adaptive_inner(
         missing_sources: missing.clone(),
         meta_conflict,
         methods: details,
+        baseline_count: active_baselines.len(),
+        rejected_baselines: rejected,
     })
 }
 
@@ -357,7 +420,7 @@ fn method_divergences_and_deltas(
 }
 
 // ---------------------------------------------------------------------------
-// Multi-split baseline statistics
+// Multi-split baseline statistics (single-baseline fallback)
 // ---------------------------------------------------------------------------
 
 /// Returns per-method (mean_d, var_d, mean_|ΔH|, var_|ΔH|) from 3 quarter-pair splits.
@@ -436,6 +499,193 @@ fn merge_collections(a: &LogCollection, b: &LogCollection) -> LogCollection {
         sources.insert(*id, EventStream { events });
     }
     LogCollection { sources, metadata: a.metadata.clone() }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-baseline: pairwise stats, outlier rejection, trend detection
+// ---------------------------------------------------------------------------
+
+/// Compute per-method divergence samples from all baseline pairs.
+/// Returns ([div_samples; 6], [dh_samples; 6]).
+fn pairwise_baseline_stats(
+    baselines: &[&LogCollection],
+    pairs: &[SourceId],
+) -> ([Vec<f64>; 6], [Vec<f64>; 6]) {
+    let mut div_samples: [Vec<f64>; 6] = Default::default();
+    let mut dh_samples: [Vec<f64>; 6] = Default::default();
+
+    for i in 0..baselines.len() {
+        for j in i + 1..baselines.len() {
+            let ra = extract(&baselines[i]);
+            let rb = extract(&baselines[j]);
+            let source_divs: HashMap<SourceId, SourceReport> = pairs.iter().map(|&id| {
+                let div = if ra.distributions.contains_key(&id) && rb.distributions.contains_key(&id) {
+                    distributional_divergence(&ra.distributions[&id], &rb.distributions[&id])
+                } else { 1.0 };
+                (id, SourceReport { divergence: div, contribution: 0.0, top_events: vec![] })
+            }).collect();
+            let obs = method_divergences_and_deltas(&ra, &rb, pairs, &source_divs, &None);
+            for m in 0..6 {
+                div_samples[m].push(obs[m].0);
+                dh_samples[m].push(obs[m].1.abs());
+            }
+        }
+    }
+    (div_samples, dh_samples)
+}
+
+/// Empirical CDF: fraction of samples strictly less than value.
+/// Using strict inequality prevents a test value equal to a pairwise sample from scoring 1.0.
+/// Returns 0.5 if no samples (maximally uncertain).
+fn empirical_commitment(samples: &[f64], value: f64) -> f64 {
+    if samples.is_empty() { return 0.5; }
+    let count = samples.iter().filter(|&&s| s < value).count();
+    count as f64 / samples.len() as f64
+}
+
+/// Reject baselines whose mean pairwise divergence to others is >2σ above the group mean.
+/// Returns (rejected_indices, active_baselines).
+fn reject_outlier_baselines<'a>(
+    baselines: &'a [LogCollection],
+    pairs: &[SourceId],
+) -> (Vec<usize>, Vec<&'a LogCollection>) {
+    if baselines.len() < 3 {
+        return (vec![], baselines.iter().collect());
+    }
+
+    // Compute mean pairwise divergence for each baseline (average over all methods)
+    let mean_divs: Vec<f64> = (0..baselines.len()).map(|i| {
+        let mut total = 0.0f64;
+        let mut count = 0usize;
+        for j in 0..baselines.len() {
+            if i == j { continue; }
+            let ra = extract(&baselines[i]);
+            let rb = extract(&baselines[j]);
+            let source_divs: HashMap<SourceId, SourceReport> = pairs.iter().map(|&id| {
+                let div = if ra.distributions.contains_key(&id) && rb.distributions.contains_key(&id) {
+                    distributional_divergence(&ra.distributions[&id], &rb.distributions[&id])
+                } else { 1.0 };
+                (id, SourceReport { divergence: div, contribution: 0.0, top_events: vec![] })
+            }).collect();
+            let obs = method_divergences_and_deltas(&ra, &rb, pairs, &source_divs, &None);
+            total += obs.iter().map(|(d, _)| d).sum::<f64>() / 6.0;
+            count += 1;
+        }
+        if count > 0 { total / count as f64 } else { 0.0 }
+    }).collect();
+
+    let group_mean = mean_divs.iter().sum::<f64>() / mean_divs.len() as f64;
+    let group_std = {
+        let var = mean_divs.iter().map(|d| (d - group_mean).powi(2)).sum::<f64>() / mean_divs.len() as f64;
+        var.sqrt()
+    };
+    let threshold = group_mean + 2.0 * group_std;
+
+    let mut rejected = vec![];
+    let mut active = vec![];
+    for (i, b) in baselines.iter().enumerate() {
+        if group_std > 1e-10 && mean_divs[i] > threshold {
+            rejected.push(i);
+        } else {
+            active.push(b);
+        }
+    }
+    if active.is_empty() { active = baselines.iter().collect(); } // never reject all
+    (rejected, active)
+}
+
+/// Trend detection: for each method, fit linear regression on divergences of ordered
+/// baselines against the first baseline, then compute z-score of test divergence
+/// relative to the extrapolated prediction.
+fn trend_signals(
+    baselines: &[&LogCollection],
+    test: &LogCollection,
+    pairs: &[SourceId],
+) -> [Option<f64>; 6] {
+    let ref_rep = extract(baselines[0]);
+
+    // Divergences of each subsequent baseline against baseline[0]
+    let baseline_divs: Vec<[f64; 6]> = (1..baselines.len()).map(|i| {
+        let rb = extract(baselines[i]);
+        let source_divs: HashMap<SourceId, SourceReport> = pairs.iter().map(|&id| {
+            let div = if ref_rep.distributions.contains_key(&id) && rb.distributions.contains_key(&id) {
+                distributional_divergence(&ref_rep.distributions[&id], &rb.distributions[&id])
+            } else { 1.0 };
+            (id, SourceReport { divergence: div, contribution: 0.0, top_events: vec![] })
+        }).collect();
+        let obs = method_divergences_and_deltas(&ref_rep, &rb, pairs, &source_divs, &None);
+        std::array::from_fn(|m| obs[m].0)
+    }).collect();
+
+    let t_rep = extract(test);
+    let test_source_divs: HashMap<SourceId, SourceReport> = pairs.iter().map(|&id| {
+        let div = if ref_rep.distributions.contains_key(&id) && t_rep.distributions.contains_key(&id) {
+            distributional_divergence(&ref_rep.distributions[&id], &t_rep.distributions[&id])
+        } else { 1.0 };
+        (id, SourceReport { divergence: div, contribution: 0.0, top_events: vec![] })
+    }).collect();
+    let test_obs = method_divergences_and_deltas(&ref_rep, &t_rep, pairs, &test_source_divs, &None);
+
+    std::array::from_fn(|m| {
+        let n = baseline_divs.len();
+        if n < 2 { return None; }
+        // xs = 1..n (baseline indices), ys = divergences
+        let xs: Vec<f64> = (1..=n).map(|i| i as f64).collect();
+        let ys: Vec<f64> = baseline_divs.iter().map(|d| d[m]).collect();
+        let (slope, intercept, residual_std) = linear_regression(&xs, &ys);
+        let predicted = slope * (n + 1) as f64 + intercept;
+        if residual_std < 1e-10 { return None; }
+        Some((test_obs[m].0 - predicted) / residual_std)
+    })
+}
+
+/// Simple OLS linear regression. Returns (slope, intercept, residual_std).
+fn linear_regression(xs: &[f64], ys: &[f64]) -> (f64, f64, f64) {
+    let n = xs.len() as f64;
+    let mx = xs.iter().sum::<f64>() / n;
+    let my = ys.iter().sum::<f64>() / n;
+    let ss_xx: f64 = xs.iter().map(|x| (x - mx).powi(2)).sum();
+    let ss_xy: f64 = xs.iter().zip(ys.iter()).map(|(x, y)| (x - mx) * (y - my)).sum();
+    let slope = if ss_xx > 1e-10 { ss_xy / ss_xx } else { 0.0 };
+    let intercept = my - slope * mx;
+    let residuals: Vec<f64> = xs.iter().zip(ys.iter())
+        .map(|(x, y)| y - (slope * x + intercept)).collect();
+    let res_var = residuals.iter().map(|r| r.powi(2)).sum::<f64>() / n;
+    (slope, intercept, res_var.sqrt())
+}
+
+fn mean_var(div_samples: &[f64], dh_samples: &[f64]) -> (f64, f64, f64, f64) {
+    // Single-baseline encoding: [mean, std] stored as 2-element vec
+    let (mean_d, var_d) = if div_samples.len() == 2 {
+        (div_samples[0], div_samples[1].powi(2))
+    } else if div_samples.is_empty() {
+        (0.0, 0.0)
+    } else {
+        let m = div_samples.iter().sum::<f64>() / div_samples.len() as f64;
+        let v = div_samples.iter().map(|x| (x - m).powi(2)).sum::<f64>() / div_samples.len() as f64;
+        (m, v)
+    };
+    let (mean_dh, var_dh) = if dh_samples.len() == 2 {
+        (dh_samples[0], dh_samples[1].powi(2))
+    } else if dh_samples.is_empty() {
+        (0.0, 0.0)
+    } else {
+        let m = dh_samples.iter().sum::<f64>() / dh_samples.len() as f64;
+        let v = dh_samples.iter().map(|x| (x - m).powi(2)).sum::<f64>() / dh_samples.len() as f64;
+        (m, v)
+    };
+    (mean_d, var_d, mean_dh, var_dh)
+}
+
+/// Source pairs across multiple baselines: intersection of all baselines ∩ test (SO),
+/// or union of baselines ∩ test (MO).
+fn multi_source_pairs(
+    baselines: &[LogCollection],
+    test: &LogCollection,
+    mode: &ComparisonMode,
+) -> Result<(Vec<SourceId>, MissingSourceReport), DetectError> {
+    // Use first baseline as reference for missing-source reporting
+    source_pairs(&baselines[0], test, mode)
 }
 
 // ---------------------------------------------------------------------------

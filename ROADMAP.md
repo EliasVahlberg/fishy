@@ -118,3 +118,20 @@ Same as M8:
 - baseline vs baseline → score < 0.3
 - normal vs normal (adjacent days) → score < 0.3
 - normal vs attack → score > 0.7
+
+## Milestone 12 — Multi-Baseline Support ✅
+> Replace within-collection quarter-split variance with real between-collection variance.
+> Enables self-calibrating thresholds and eliminates hardcoded per-method sigmoid midpoints.
+
+- [x] `detect(baselines: &[LogCollection], test, config)` — API change, single baseline still works
+- [x] Pairwise baseline divergences → empirical CDF per method (replaces sigmoid + METHOD_MIDPOINTS)
+- [x] Min-divergence scoring: test compared against nearest baseline, not fixed reference
+- [x] Baseline outlier rejection — flag baselines with mean pairwise divergence >2σ from group
+- [x] Trend detection — linear regression on ordered baselines, flag if test breaks trend
+- [x] CLI: multiple `-b` flags accepted
+- [x] Validated on AIT russellmitchell:
+  - Single baseline day_1 vs day_2 (normal): 0.00 ✅
+  - Single baseline day_2 vs day_3 (attack): 0.96 ✅
+  - 3 baselines day_0+day_1+day_2 vs day_3 (attack): 1.00 ✅
+  - 3 baselines vs day_1 (in-distribution): 0.00 ✅
+  - 3 baselines vs day_2 (in-distribution): 0.00 ✅

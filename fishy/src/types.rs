@@ -80,6 +80,10 @@ pub struct AnomalyReport {
     pub meta_conflict: f64,
     /// Per-method breakdown from the adaptive fusion pass.
     pub methods: Vec<MethodDetail>,
+    /// Number of baselines used (after outlier rejection).
+    pub baseline_count: usize,
+    /// Indices of baselines rejected as outliers (mean pairwise divergence >2σ from group).
+    pub rejected_baselines: Vec<usize>,
 }
 
 /// Per-method detail from the adaptive fusion pass.
@@ -90,8 +94,17 @@ pub struct MethodDetail {
     pub divergence: f64,
     pub entropy_delta: f64,
     pub baseline_entropy: f64,
+    /// Percentile of test divergence within baseline-pair distribution (0–1).
+    /// 1.0 = higher than all baseline pairs (maximally anomalous).
+    /// None when fewer than 2 baselines (falls back to z-score path).
+    pub divergence_percentile: Option<f64>,
+    pub entropy_delta_percentile: Option<f64>,
+    /// Legacy z-scores (used when only 1 baseline available).
     pub z_divergence: f64,
     pub z_entropy_delta: f64,
+    /// Trend signal: z-score of test divergence relative to linear trend extrapolated
+    /// from ordered baselines. Positive = above trend (anomalous direction).
+    pub trend_z: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
