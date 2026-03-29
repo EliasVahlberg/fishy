@@ -135,3 +135,25 @@ Same as M8:
   - 3 baselines day_0+day_1+day_2 vs day_3 (attack): 1.00 ✅
   - 3 baselines vs day_1 (in-distribution): 0.00 ✅
   - 3 baselines vs day_2 (in-distribution): 0.00 ✅
+
+## Milestone 13 — Performance Optimization
+> Profile and fix the main CPU bottlenecks before considering GPU acceleration.
+
+### Known issues (fix first)
+- [ ] Cache extracted `Representations` — `reject_outlier_baselines` and `pairwise_baseline_stats` both call `extract()` independently, causing redundant eigendecompositions. Pre-extract all baselines once and reuse.
+- [ ] Deduplicate pairwise extractions — in `pairwise_baseline_stats`, each baseline is extracted once per pair it appears in. With 3 baselines, baseline[0] is extracted twice. Cache by index.
+
+### Profiling
+- [ ] Profile a 3-baseline run with `cargo flamegraph` to confirm eigendecomposition dominates
+- [ ] Measure per-method wall time to identify secondary bottlenecks
+
+### Potential further optimizations (after profiling)
+- [ ] Incremental eigendecomposition — warm-start from previous result when collections are similar
+- [ ] Skip co-occurrence for sources with low event counts (already gated at 32, consider raising)
+
+### GPU acceleration (future exploration)
+> Add only after CPU optimizations are exhausted and profiling shows GPU would help.
+- [ ] `wgpu` feature flag — optional GPU compute path, falls back to CPU
+- [ ] Batched FFT across all sources × all baseline pairs (most parallelizable, well-understood)
+- [ ] Batched eigendecomposition (128×128 Jacobi iteration in WGSL) — hardest part, highest potential speedup
+- [ ] Benchmark: measure actual speedup on realistic workload (3 baselines, 50+ sources)
