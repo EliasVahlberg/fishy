@@ -1,4 +1,5 @@
 use crate::types::{EigenSpectrum, TemplateId};
+use nalgebra::DMatrix;
 use std::collections::HashMap;
 
 /// Laplacian eigenvalue spectrum of an event co-occurrence graph.
@@ -64,79 +65,21 @@ pub fn co_occurrence_spectrum(events: &[(TemplateId, u64)], window: u64) -> Eige
     let idx: HashMap<TemplateId, usize> =
         nodes.iter().enumerate().map(|(i, &id)| (id, i)).collect();
 
-    // Build Laplacian L = D - A.
-    let mut lap = vec![vec![0.0f64; n]; n];
+    // Build Laplacian L = D - A as a nalgebra DMatrix.
+    let mut lap = DMatrix::<f64>::zeros(n, n);
     for (&(a, b), &w) in &adj {
         let i = idx[&a];
         let j = idx[&b];
-        lap[i][j] -= w;
-        lap[j][i] -= w;
-        lap[i][i] += w;
-        lap[j][j] += w;
+        lap[(i, j)] -= w;
+        lap[(j, i)] -= w;
+        lap[(i, i)] += w;
+        lap[(j, j)] += w;
     }
 
-    let mut eigenvalues = symmetric_eigenvalues(lap);
+    let decomp = lap.symmetric_eigen();
+    let mut eigenvalues: Vec<f64> = decomp.eigenvalues.iter().copied().collect();
     eigenvalues.sort_by(|a, b| a.partial_cmp(b).unwrap());
     EigenSpectrum { eigenvalues }
-}
-
-// ---------------------------------------------------------------------------
-// Symmetric eigenvalue solver via Jacobi iterations
-// ---------------------------------------------------------------------------
-
-fn symmetric_eigenvalues(mut a: Vec<Vec<f64>>) -> Vec<f64> {
-    let n = a.len();
-    if n == 0 {
-        return vec![];
-    }
-    if n == 1 {
-        return vec![a[0][0]];
-    }
-
-    // Jacobi sweeps until off-diagonal norm is negligible.
-    for _ in 0..100 * n * n {
-        // Find largest off-diagonal element.
-        let (mut p, mut q, mut max_val) = (0, 1, 0.0f64);
-        for i in 0..n {
-            for j in i + 1..n {
-                if a[i][j].abs() > max_val {
-                    max_val = a[i][j].abs();
-                    p = i;
-                    q = j;
-                }
-            }
-        }
-        if max_val < 1e-10 {
-            break;
-        }
-
-        // Compute Jacobi rotation angle.
-        let theta = 0.5 * (a[q][q] - a[p][p]) / (a[p][q] + 1e-30);
-        let t = theta.signum() / (theta.abs() + (1.0 + theta * theta).sqrt());
-        let c = 1.0 / (1.0 + t * t).sqrt();
-        let s = t * c;
-
-        // Apply rotation.
-        let app = a[p][p];
-        let aqq = a[q][q];
-        let apq = a[p][q];
-        a[p][p] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
-        a[q][q] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
-        a[p][q] = 0.0;
-        a[q][p] = 0.0;
-        for r in 0..n {
-            if r != p && r != q {
-                let arp = a[r][p];
-                let arq = a[r][q];
-                a[r][p] = c * arp - s * arq;
-                a[p][r] = a[r][p];
-                a[r][q] = s * arp + c * arq;
-                a[q][r] = a[r][q];
-            }
-        }
-    }
-
-    (0..n).map(|i| a[i][i]).collect()
 }
 
 #[cfg(test)]
