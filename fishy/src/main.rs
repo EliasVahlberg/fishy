@@ -32,10 +32,24 @@ struct Cli {
     /// Duration tolerance for temporal validation, 0.0 = disabled [default: 0.5]
     #[arg(long, default_value = "0.5")]
     duration_tolerance: f32,
+
+    /// Use GPU acceleration (requires --features gpu build)
+    #[cfg(feature = "gpu")]
+    #[arg(long)]
+    gpu: bool,
 }
 
 fn main() {
     let cli = Cli::parse();
+
+    #[cfg(feature = "gpu")]
+    if cli.gpu {
+        if fishy::init_gpu() {
+            eprintln!("GPU: initialised");
+        } else {
+            eprintln!("GPU: no suitable device found, falling back to CPU");
+        }
+    }
 
     if cli.baseline.is_empty() {
         eprintln!("error: at least one -b baseline directory required");

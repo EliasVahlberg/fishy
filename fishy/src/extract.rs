@@ -35,6 +35,10 @@ pub fn extract(collection: &LogCollection) -> Representations {
     let duration = collection.metadata.end_time.saturating_sub(collection.metadata.start_time);
     let bin_width = adaptive_bin_width(duration);
     let co_window = adaptive_co_window(bin_width);
+    #[cfg(feature = "gpu")]
+    if let Some(gpu) = crate::GPU_CONTEXT.get() {
+        return extract_gpu(collection, bin_width, co_window, gpu);
+    }
     extract_with(collection, bin_width, co_window)
 }
 
@@ -136,4 +140,94 @@ pub fn timed_events(stream: &EventStream) -> Vec<(TemplateId, u64)> {
         .iter()
         .map(|e| (e.template_id, e.timestamp.map(|t| t.saturating_sub(base)).unwrap_or(0)))
         .collect()
+}
+
+/// GPU-accelerated extract: batches FFT and eigendecomposition across all sources.
+#[cfg(feature = "gpu")]
+pub fn extract_gpu(
+    collection: &LogCollection,
+    bin_width: u64,
+    co_window: u64,
+    gpu: &crate::gpu::GpuContext,
+) -> Representations {
+    use analysis::{co_occurrence_spectrum, mutual_information_matrix_timed, wavelet_decompose};
+
+    let mut sources: Vec<SourceId> = collection.sources.keys().copied().collect();
+    sources.sort_by_key(|s| s.0);
+
+    let distributions: HashMap<SourceId, EventDistribution> = sources
+        .iter()
+        .map(|&id| (id, to_distribution(&collection.sources[&id])))
+        .collect();
+
+    // Build event-count histograms for GPU FFT (always 1024 bins)
+    let fft_size = 1024usize;
+    let bins: Vec<Vec<f32>> = sources.iter().map(|&id| {
+        let mut b = vec![0.0f32; fft_size];
+        for e in &collection.sources[&id].events {
+            if let Some(ts) = e.timestamp {
+                let idx = (ts / bin_width) as usize;
+                if idx < fft_size { b[idx] += 1.0; }
+            }
+        }
+        b
+    }).collect();
+
+    let gpu_spectra = gpu.batch_fft(&bins);
+    let spectra: HashMap<SourceId, PowerSpectrum> = sources.iter().zip(gpu_spectra).map(|(&id, s)| (id, s)).collect();
+
+    // Co-occurrence eigendecomposition stays on CPU — Jacobi iteration is sequential
+    // and doesn't map well to GPU (convergence check, shared memory limits).
+    let eigen: HashMap<SourceId, EigenSpectrum> = sources.iter().map(|&id| {
+        let events = timed_events(&collection.sources[&id]);
+        (id, co_occurrence_spectrum(&events, co_window))
+    }).collect();    // Wavelets and MI still on CPU (wavelet is cheap; MI is hard to GPU-ize)
+    let wavelets: HashMap<SourceId, WaveletCoefficients> = sources.iter().map(|&id| {
+        let times = event_times(&collection.sources[&id]);
+        (id, wavelet_decompose(&times, bin_width, 4))
+    }).collect();
+
+    let mi_matrix = if sources.len() >= 2 {
+        let timed: Vec<Vec<(TemplateId, u64)>> = sources.iter()
+            .map(|id| timed_events(&collection.sources[id])).collect();
+        let col_refs: Vec<(SourceId, &[(TemplateId, u64)])> =
+            sources.iter().zip(timed.iter()).map(|(&id, v)| (id, v.as_slice())).collect();
+        Some(mutual_information_matrix_timed(&col_refs, bin_width))
+    } else { None };
+
+    Representations { distributions, spectra, eigen, wavelets, mi_matrix }
+}
+
+#[cfg(feature = "gpu")]
+fn next_power_of_two(n: usize) -> usize {
+    let mut p = 1;
+    while p < n { p <<= 1; }
+    p
+}
+
+/// Build a co-occurrence adjacency matrix (capped at MAX_CO_NODES templates).
+/// Returns a flattened n×n f32 matrix.
+#[cfg(feature = "gpu")]
+fn build_co_matrix(events: &[(TemplateId, u64)], window: u64, n: usize) -> Vec<f32> {
+    use std::collections::HashMap as HM;
+    // Map template IDs to matrix indices (top-n by frequency)
+    let mut freq: HM<u32, usize> = HM::new();
+    for (tid, _) in events { *freq.entry(tid.0).or_insert(0) += 1; }
+    let mut sorted: Vec<(u32, usize)> = freq.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    let idx_map: HM<u32, usize> = sorted.iter().take(n).enumerate().map(|(i, (tid, _))| (*tid, i)).collect();
+
+    let mut mat = vec![0.0f32; n * n];
+    for i in 0..events.len() {
+        let (tid_i, ts_i) = events[i];
+        let Some(&ri) = idx_map.get(&tid_i.0) else { continue };
+        for j in i + 1..events.len() {
+            let (tid_j, ts_j) = events[j];
+            if ts_j.saturating_sub(ts_i) > window { break; }
+            let Some(&rj) = idx_map.get(&tid_j.0) else { continue };
+            mat[ri * n + rj] += 1.0;
+            mat[rj * n + ri] += 1.0;
+        }
+    }
+    mat
 }

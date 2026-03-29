@@ -13,11 +13,29 @@ mod extract;
 mod loader;
 mod types;
 
+#[cfg(feature = "gpu")]
+pub mod gpu;
+
 #[cfg(feature = "parallel")]
 use rayon::join;
 
 pub use loader::load_collection;
 pub use types::*;
+
+/// Lazily-initialised GPU context. None if no suitable GPU found or `gpu` feature disabled.
+#[cfg(feature = "gpu")]
+pub static GPU_CONTEXT: std::sync::OnceLock<gpu::GpuContext> = std::sync::OnceLock::new();
+
+/// Initialise the GPU context. Call once at startup before any `detect()` calls.
+/// Returns true if a GPU was found and initialised.
+#[cfg(feature = "gpu")]
+pub fn init_gpu() -> bool {
+    if let Some(ctx) = gpu::GpuContext::try_new() {
+        GPU_CONTEXT.set(ctx).is_ok()
+    } else {
+        false
+    }
+}
 
 use analysis::{
     bpa_from_zscore, distributional_divergence, ds_combine_many, evidence_bpa, matrix_entropy,
