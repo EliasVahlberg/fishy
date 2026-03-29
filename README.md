@@ -68,6 +68,12 @@ No training. No hyperparameters. Calibration comes from the baseline itself.
 | AIT-LDSv2 russellmitchell | 52 | 847K | 0.00–0.13 | 1.00 |
 | AIT-LDSv2 santos | 52 | 992K | 0.00–0.24 | 0.82–1.00 |
 
+## Research
+
+The method is described in detail in [docs/paper/fishy_paper.pdf](docs/paper/fishy_paper.pdf):
+
+> Elias Vahlberg. *fishy: Multi-Source Log Collection Anomaly Detection via Information-Theoretic Evidence Fusion.* March 2026.
+
 ## Status
 
 See `ROADMAP.md` for completed and planned milestones.

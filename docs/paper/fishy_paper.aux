@@ -1,0 +1,77 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{logms}
+\citation{colog}
+\citation{hitanomaly}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Problem Formulation}{1}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Collections and Sources}{1}{subsection.2.1}\protected@file@percent }
+\citation{lin1991}
+\citation{lin1991}
+\citation{wiener1930}
+\citation{mallat1989}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}The Comparison Problem}{2}{subsection.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Comparison Modes}{2}{subsection.2.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.4}Temporal Alignment}{2}{subsection.2.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Analysis Methods}{2}{section.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Applicability Gating}{2}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Distributional Divergence (dist)}{2}{subsection.3.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Cross-Source Dependency Shift (dep)}{2}{subsection.3.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}Spectral Fingerprinting (spec)}{2}{subsection.3.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.5}Wavelet Energy Analysis (wavelet)}{2}{subsection.3.5}\protected@file@percent }
+\citation{dempster1968}
+\citation{shafer1976}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.6}Co-occurrence Structure (co)}{3}{subsection.3.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.7}Evidence Conflict (conflict)}{3}{subsection.3.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Adaptive Fusion Pipeline}{3}{section.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}BPA Construction}{3}{subsection.4.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}DS Meta-Fusion}{3}{subsection.4.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Score Interpretation}{3}{subsection.4.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Multi-Baseline Variance Estimation}{3}{section.5}\protected@file@percent }
+\newlabel{sec:multibaseline}{{5}{3}{Multi-Baseline Variance Estimation}{section.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Motivation}{3}{subsection.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Nearest-Baseline Scoring}{3}{subsection.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Outlier Baseline Rejection}{3}{subsection.5.3}\protected@file@percent }
+\citation{drain}
+\citation{ait}
+\citation{bgl}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Adaptive fusion pipeline. Six analysis methods run in parallel after applicability gating. With $K \geq 3$ baselines, BPAs are constructed from empirical percentiles of pairwise baseline divergences; with a single baseline, a sigmoid mapping on z-scores is used as a fallback.}}{4}{figure.1}\protected@file@percent }
+\newlabel{fig:pipeline}{{1}{4}{Adaptive fusion pipeline. Six analysis methods run in parallel after applicability gating. With $K \geq 3$ baselines, BPAs are constructed from empirical percentiles of pairwise baseline divergences; with a single baseline, a sigmoid mapping on z-scores is used as a fallback}{figure.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}Trend Detection}{4}{subsection.5.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Implementation}{4}{section.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Workspace Structure}{4}{subsection.6.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Encoder: Drain Template Extraction}{4}{subsection.6.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Collection Format}{4}{subsection.6.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Three-crate workspace. \texttt  {analysis} is domain-agnostic (no \texttt  {LogCollection} imports). \texttt  {fishy} orchestrates the fusion pipeline. \texttt  {encoder} tokenizes raw logs into the collection format.}}{4}{figure.2}\protected@file@percent }
+\newlabel{fig:arch}{{2}{4}{Three-crate workspace. \texttt {analysis} is domain-agnostic (no \texttt {LogCollection} imports). \texttt {fishy} orchestrates the fusion pipeline. \texttt {encoder} tokenizes raw logs into the collection format}{figure.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {7}Evaluation}{4}{section.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Dataset}{4}{subsection.7.1}\protected@file@percent }
+\citation{bgl}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Experimental Setup}{5}{subsection.7.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Results}{5}{subsection.7.3}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Anomaly scores across all evaluated collection pairs. $s$ = score, $u$ = uncertainty.}}{5}{table.1}\protected@file@percent }
+\newlabel{tab:results}{{1}{5}{Anomaly scores across all evaluated collection pairs. $s$ = score, $u$ = uncertainty}{table.1}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Anomaly scores for all collection pairs. Normal pairs (green) score near 0; attack pairs (red) score near 1. The two elevated normal bars ($^\dagger $) are day\_0 startup artifacts in the russellmitchell scenario, addressed by multi-baseline calibration.}}{5}{figure.3}\protected@file@percent }
+\newlabel{fig:scores}{{3}{5}{Anomaly scores for all collection pairs. Normal pairs (green) score near 0; attack pairs (red) score near 1. The two elevated normal bars ($^\dagger $) are day\_0 startup artifacts in the russellmitchell scenario, addressed by multi-baseline calibration}{figure.3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Discussion}{5}{section.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.1}Limitations}{5}{subsection.8.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.2}Relationship to Existing Frameworks}{5}{subsection.8.2}\protected@file@percent }
+\citation{mde}
+\bibcite{logms}{1}
+\bibcite{colog}{2}
+\bibcite{hitanomaly}{3}
+\bibcite{drain}{4}
+\bibcite{ait}{5}
+\bibcite{bgl}{6}
+\bibcite{mde}{7}
+\bibcite{dempster1968}{8}
+\bibcite{shafer1976}{9}
+\bibcite{lin1991}{10}
+\bibcite{mallat1989}{11}
+\bibcite{wiener1930}{12}
+\bibcite{gretton2012}{13}
+\bibcite{munoz2018}{14}
+\@writefile{toc}{\contentsline {section}{\numberline {9}Conclusion}{6}{section.9}\protected@file@percent }
+\gdef \@abspage@last{6}
