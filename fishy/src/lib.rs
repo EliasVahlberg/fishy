@@ -114,14 +114,24 @@ fn adaptive_inner(
     config: &DetectConfig,
     only_method: Option<usize>,
 ) -> Result<AnomalyReport, DetectError> {
-    // Use first non-rejected baseline as reference for entropy gating and source scores
-    let (rejected, active_baselines) = reject_outlier_baselines(baselines, pairs);
-    let baseline = &active_baselines[0];
-    // 1. Extract representations
+    // Pre-extract all baseline representations once — reused by outlier rejection,
+    // pairwise stats, min-divergence scoring, and trend detection.
     #[cfg(feature = "parallel")]
-    let (b_rep, t_rep) = join(|| extract(baseline), || extract(test));
+    let b_reps: Vec<extract::Representations> = {
+        use rayon::prelude::*;
+        baselines.par_iter().map(extract).collect()
+    };
     #[cfg(not(feature = "parallel"))]
-    let (b_rep, t_rep) = (extract(baseline), extract(test));
+    let b_reps: Vec<extract::Representations> = baselines.iter().map(extract).collect();
+
+    let (rejected, active_idx) = reject_outlier_baselines(&b_reps, pairs);
+    let active_reps: Vec<&extract::Representations> = active_idx.iter().map(|&i| &b_reps[i]).collect();
+    let active_baselines: Vec<&LogCollection> = active_idx.iter().map(|&i| &baselines[i]).collect();
+    let baseline = active_baselines[0];
+    let b_rep = active_reps[0];
+
+    // Extract test once
+    let t_rep = extract(test);
 
     // 3. Baseline entropy + applicability gate (from reference baseline)
     let b_entropies = method_entropies(&b_rep, pairs);
@@ -134,11 +144,9 @@ fn adaptive_inner(
     });
 
     // 4. Method divergences: minimum test-to-baseline divergence per method.
-    // Using the minimum means: if the test is close to ANY baseline, it's not anomalous.
     let observations: [(f64, f64); 6] = {
         let mut min_obs: [(f64, f64); 6] = [(f64::MAX, f64::MAX); 6];
-        for b in &active_baselines {
-            let b_rep_i = extract(b);
+        for b_rep_i in &active_reps {
             let b_source_scores: HashMap<SourceId, SourceReport> = {
                 let mut ss = HashMap::new();
                 for &id in &missing.baseline_only {
@@ -154,14 +162,11 @@ fn adaptive_inner(
                 }
                 ss
             };
-            let obs = method_divergences_and_deltas(&b_rep_i, &t_rep, pairs, &b_source_scores, &config.source_weights);
+            let obs = method_divergences_and_deltas(b_rep_i, &t_rep, pairs, &b_source_scores, &config.source_weights);
             for m in 0..6 {
-                if obs[m].0 < min_obs[m].0 {
-                    min_obs[m] = obs[m];
-                }
+                if obs[m].0 < min_obs[m].0 { min_obs[m] = obs[m]; }
             }
         }
-        // Replace MAX sentinels with 0 for methods with no valid comparison
         std::array::from_fn(|m| if min_obs[m].0 == f64::MAX { (0.0, 0.0) } else { min_obs[m] })
     };
 
@@ -182,8 +187,8 @@ fn adaptive_inner(
     // 5. Baseline variance: pairwise (≥3 baselines → ≥3 samples) or quarter-split fallback.
     // Empirical CDF requires ≥3 samples to be meaningful; 2 baselines gives only 1 pair.
     let (div_samples, dh_samples): ([Vec<f64>; 6], [Vec<f64>; 6]) =
-        if active_baselines.len() >= 3 {
-            pairwise_baseline_stats(&active_baselines, pairs)
+        if active_reps.len() >= 3 {
+            pairwise_baseline_stats(&active_reps, pairs)
         } else {
             // 1-2 baselines: quarter-split of first baseline. Encode as [mean, std] (len=2)
             // so the sigmoid fallback path is triggered in the BPA loop.
@@ -195,8 +200,8 @@ fn adaptive_inner(
         };
 
     // 6. Trend signals (only meaningful with ≥3 ordered baselines)
-    let trend_zs = if active_baselines.len() >= 3 {
-        trend_signals(&active_baselines, test, pairs)
+    let trend_zs = if active_reps.len() >= 3 {
+        trend_signals(&active_reps, &t_rep, pairs)
     } else {
         [None; 6]
     };
@@ -282,7 +287,7 @@ fn adaptive_inner(
         missing_sources: missing.clone(),
         meta_conflict,
         methods: details,
-        baseline_count: active_baselines.len(),
+        baseline_count: active_reps.len(),
         rejected_baselines: rejected,
     })
 }
@@ -508,23 +513,22 @@ fn merge_collections(a: &LogCollection, b: &LogCollection) -> LogCollection {
 /// Compute per-method divergence samples from all baseline pairs.
 /// Returns ([div_samples; 6], [dh_samples; 6]).
 fn pairwise_baseline_stats(
-    baselines: &[&LogCollection],
+    reps: &[&extract::Representations],
     pairs: &[SourceId],
 ) -> ([Vec<f64>; 6], [Vec<f64>; 6]) {
     let mut div_samples: [Vec<f64>; 6] = Default::default();
     let mut dh_samples: [Vec<f64>; 6] = Default::default();
 
-    for i in 0..baselines.len() {
-        for j in i + 1..baselines.len() {
-            let ra = extract(&baselines[i]);
-            let rb = extract(&baselines[j]);
+    for i in 0..reps.len() {
+        for j in i + 1..reps.len() {
+            let (ra, rb) = (reps[i], reps[j]);
             let source_divs: HashMap<SourceId, SourceReport> = pairs.iter().map(|&id| {
                 let div = if ra.distributions.contains_key(&id) && rb.distributions.contains_key(&id) {
                     distributional_divergence(&ra.distributions[&id], &rb.distributions[&id])
                 } else { 1.0 };
                 (id, SourceReport { divergence: div, contribution: 0.0, top_events: vec![] })
             }).collect();
-            let obs = method_divergences_and_deltas(&ra, &rb, pairs, &source_divs, &None);
+            let obs = method_divergences_and_deltas(ra, rb, pairs, &source_divs, &None);
             for m in 0..6 {
                 div_samples[m].push(obs[m].0);
                 dh_samples[m].push(obs[m].1.abs());
@@ -545,29 +549,27 @@ fn empirical_commitment(samples: &[f64], value: f64) -> f64 {
 
 /// Reject baselines whose mean pairwise divergence to others is >2σ above the group mean.
 /// Returns (rejected_indices, active_baselines).
-fn reject_outlier_baselines<'a>(
-    baselines: &'a [LogCollection],
+fn reject_outlier_baselines(
+    reps: &[extract::Representations],
     pairs: &[SourceId],
-) -> (Vec<usize>, Vec<&'a LogCollection>) {
-    if baselines.len() < 3 {
-        return (vec![], baselines.iter().collect());
+) -> (Vec<usize>, Vec<usize>) {
+    if reps.len() < 3 {
+        return (vec![], (0..reps.len()).collect());
     }
 
-    // Compute mean pairwise divergence for each baseline (average over all methods)
-    let mean_divs: Vec<f64> = (0..baselines.len()).map(|i| {
+    let mean_divs: Vec<f64> = (0..reps.len()).map(|i| {
         let mut total = 0.0f64;
         let mut count = 0usize;
-        for j in 0..baselines.len() {
+        for j in 0..reps.len() {
             if i == j { continue; }
-            let ra = extract(&baselines[i]);
-            let rb = extract(&baselines[j]);
+            let (ra, rb) = (&reps[i], &reps[j]);
             let source_divs: HashMap<SourceId, SourceReport> = pairs.iter().map(|&id| {
                 let div = if ra.distributions.contains_key(&id) && rb.distributions.contains_key(&id) {
                     distributional_divergence(&ra.distributions[&id], &rb.distributions[&id])
                 } else { 1.0 };
                 (id, SourceReport { divergence: div, contribution: 0.0, top_events: vec![] })
             }).collect();
-            let obs = method_divergences_and_deltas(&ra, &rb, pairs, &source_divs, &None);
+            let obs = method_divergences_and_deltas(ra, rb, pairs, &source_divs, &None);
             total += obs.iter().map(|(d, _)| d).sum::<f64>() / 6.0;
             count += 1;
         }
@@ -583,14 +585,14 @@ fn reject_outlier_baselines<'a>(
 
     let mut rejected = vec![];
     let mut active = vec![];
-    for (i, b) in baselines.iter().enumerate() {
+    for i in 0..reps.len() {
         if group_std > 1e-10 && mean_divs[i] > threshold {
             rejected.push(i);
         } else {
-            active.push(b);
+            active.push(i);
         }
     }
-    if active.is_empty() { active = baselines.iter().collect(); } // never reject all
+    if active.is_empty() { active = (0..reps.len()).collect(); }
     (rejected, active)
 }
 
@@ -598,33 +600,31 @@ fn reject_outlier_baselines<'a>(
 /// baselines against the first baseline, then compute z-score of test divergence
 /// relative to the extrapolated prediction.
 fn trend_signals(
-    baselines: &[&LogCollection],
-    test: &LogCollection,
+    reps: &[&extract::Representations],
+    t_rep: &extract::Representations,
     pairs: &[SourceId],
 ) -> [Option<f64>; 6] {
-    let ref_rep = extract(baselines[0]);
+    let ref_rep = reps[0];
 
-    // Divergences of each subsequent baseline against baseline[0]
-    let baseline_divs: Vec<[f64; 6]> = (1..baselines.len()).map(|i| {
-        let rb = extract(baselines[i]);
+    let baseline_divs: Vec<[f64; 6]> = (1..reps.len()).map(|i| {
+        let rb = reps[i];
         let source_divs: HashMap<SourceId, SourceReport> = pairs.iter().map(|&id| {
             let div = if ref_rep.distributions.contains_key(&id) && rb.distributions.contains_key(&id) {
                 distributional_divergence(&ref_rep.distributions[&id], &rb.distributions[&id])
             } else { 1.0 };
             (id, SourceReport { divergence: div, contribution: 0.0, top_events: vec![] })
         }).collect();
-        let obs = method_divergences_and_deltas(&ref_rep, &rb, pairs, &source_divs, &None);
+        let obs = method_divergences_and_deltas(ref_rep, rb, pairs, &source_divs, &None);
         std::array::from_fn(|m| obs[m].0)
     }).collect();
 
-    let t_rep = extract(test);
     let test_source_divs: HashMap<SourceId, SourceReport> = pairs.iter().map(|&id| {
         let div = if ref_rep.distributions.contains_key(&id) && t_rep.distributions.contains_key(&id) {
             distributional_divergence(&ref_rep.distributions[&id], &t_rep.distributions[&id])
         } else { 1.0 };
         (id, SourceReport { divergence: div, contribution: 0.0, top_events: vec![] })
     }).collect();
-    let test_obs = method_divergences_and_deltas(&ref_rep, &t_rep, pairs, &test_source_divs, &None);
+    let test_obs = method_divergences_and_deltas(ref_rep, t_rep, pairs, &test_source_divs, &None);
 
     std::array::from_fn(|m| {
         let n = baseline_divs.len();
