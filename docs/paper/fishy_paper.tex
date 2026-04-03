@@ -230,42 +230,47 @@ $[0.80, 1.00]$ & definitely fishy \\
 \begin{figure*}[t]
 \centering
 \begin{tikzpicture}[
-  node distance=0.45cm and 0.6cm,
   box/.style={rectangle, rounded corners=3pt, draw=black!70, fill=gray!10,
-              text width=2.6cm, align=center, font=\small, minimum height=0.7cm},
-  decision/.style={diamond, draw=black!70, fill=yellow!15, aspect=2.2,
+              text width=2.0cm, align=center, font=\scriptsize, minimum height=0.65cm},
+  decision/.style={diamond, draw=black!70, fill=yellow!15, aspect=2.0,
                    align=center, font=\scriptsize, inner sep=1pt},
-  arr/.style={-{Stealth[length=5pt]}, thick},
-  label/.style={font=\scriptsize, text=black!60}
+  arr/.style={-{Stealth[length=4pt]}, thick},
+  lbl/.style={font=\scriptsize, text=black!60},
+  node distance=0.35cm and 0.45cm
 ]
 
-\node[box] (load)    {Load baselines\\+ test};
-\node[box, right=of load] (match)   {Source pair\\matching (SO/MO)};
-\node[box, right=of match] (extract) {Extract\\Representations};
-\node[box, right=of extract] (gate)    {Applicability\\gate ($\hat{H}_M$)};
-\node[decision, right=of gate] (kcheck) {$K \geq 3$\\baselines?};
+% Main horizontal chain (left to right)
+\node[box] (load)    {Load\\baselines + test};
+\node[box, right=of load]    (match)   {Source\\matching\\(SO/MO)};
+\node[box, right=of match]   (extract) {Extract\\Repres-\\entations};
+\node[box, right=of extract] (gate)    {Applicability\\gate\\($\hat{H}_M$)};
+\node[decision, right=of gate] (kcheck) {$K{\geq}3$?};
 
-\node[box, above right=0.5cm and 0.5cm of kcheck] (pairwise) {Pairwise\\baseline stats\\$\binom{K}{2}$ samples};
-\node[box, below right=0.5cm and 0.5cm of kcheck] (qsplit)   {Quarter-split\\variance\\(fallback)};
+% Branch up/down from decision
+\node[box, above right=0.4cm and 0.4cm of kcheck] (pairwise) {Pairwise\\baseline\\stats};
+\node[box, below right=0.4cm and 0.4cm of kcheck] (qsplit)   {Quarter-\\split\\(fallback)};
 
-\node[box, right=3.2cm of kcheck] (bpa)    {BPA\\construction};
-\node[box, right=of bpa] (ds)     {DS\\meta-fusion};
+% Merge back
+\node[box, right=2.6cm of kcheck] (bpa)    {BPA\\construction};
+\node[box, right=of bpa] (ds)     {DS\\meta-\\fusion};
 \node[box, right=of ds]  (report) {Anomaly\\Report};
 
+% Arrows
 \draw[arr] (load) -- (match);
 \draw[arr] (match) -- (extract);
 \draw[arr] (extract) -- (gate);
 \draw[arr] (gate) -- (kcheck);
-\draw[arr] (kcheck) -- node[label,above left]{yes} (pairwise);
-\draw[arr] (kcheck) -- node[label,below left]{no}  (qsplit);
+\draw[arr] (kcheck) -- node[lbl, above left=-1pt]{yes} (pairwise);
+\draw[arr] (kcheck) -- node[lbl, below left=-1pt]{no}  (qsplit);
 \draw[arr] (pairwise) -| (bpa);
 \draw[arr] (qsplit)   -| (bpa);
 \draw[arr] (bpa) -- (ds);
 \draw[arr] (ds)  -- (report);
 
-\node[label, below=0.15cm of extract] {dist · dep · spec · co · conflict · wavelet};
-\node[label, above=0.12cm of bpa]     {empirical CDF};
-\node[label, below=0.12cm of bpa]     {sigmoid (fallback)};
+% Sublabels
+\node[lbl, below=0.1cm of extract] {6 methods in parallel};
+\node[lbl, above=0.08cm of bpa]    {empirical CDF};
+\node[lbl, below=0.08cm of bpa]    {sigmoid};
 
 \end{tikzpicture}
 \caption{Adaptive fusion pipeline. Six analysis methods run in parallel after applicability gating. With $K \geq 3$ baselines, BPAs are constructed from empirical percentiles of pairwise baseline divergences; with a single baseline, a sigmoid mapping on z-scores is used as a fallback.}
