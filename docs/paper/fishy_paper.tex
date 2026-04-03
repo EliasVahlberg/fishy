@@ -330,31 +330,31 @@ Each collection is a directory containing \texttt{meta.json} (start/end timestam
 \begin{figure}[h]
 \centering
 \begin{tikzpicture}[
-  crate/.style={rectangle, rounded corners=4pt, draw=black!80, minimum width=3.2cm,
-                minimum height=0.65cm, align=center, font=\small\bfseries},
-  mod/.style={rectangle, draw=black!40, fill=gray!8, minimum width=2.8cm,
-              minimum height=0.5cm, align=center, font=\scriptsize},
-  arr/.style={-{Stealth[length=4pt]}, thick},
-  grp/.style={rectangle, rounded corners=6pt, draw=black!30, dashed, inner sep=6pt}
+  crate/.style={rectangle, rounded corners=4pt, draw=black!70, fill=gray!10,
+                text width=5.8cm, minimum height=0.9cm, align=center, font=\small\bfseries},
+  detail/.style={font=\scriptsize, text=black!55},
+  arr/.style={-{Stealth[length=5pt]}, thick, draw=black!60},
+  node distance=0.5cm
 ]
 
-\node[crate, fill=blue!12]  (enc) at (0, 3.2)  {encoder};
-\node[crate, fill=green!12] (fis) at (0, 1.8)  {fishy};
-\node[crate, fill=orange!12](ana) at (0, 0.4)  {analysis};
+\node[crate, fill=blue!10]   (enc) {\texttt{encoder}};
+\node[detail, right=0.15cm of enc] (encd) {};
+\node[below=0.08cm of enc, detail] {Drain parse tree · timestamp detection · \texttt{TemplateId} dictionary};
 
-\node[mod, right=0.4cm of enc] (drain)  {DrainTree};
-\node[mod, right=0.4cm of fis] (detect) {detect()};
-\node[mod, right=0.4cm of ana] (math)   {pure math};
+\node[crate, fill=green!10, below=0.7cm of enc] (fis) {\texttt{fishy}};
+\node[below=0.08cm of fis, detail] {detect() · adaptive fusion · multi-baseline · CLI};
 
-\node[mod, left=0.4cm of enc]  (raw)    {raw logs};
-\node[mod, left=0.4cm of fis]  (coll)   {LogCollection};
-\node[mod, left=0.4cm of ana]  (types)  {BPA, MIMatrix\ldots};
+\node[crate, fill=orange!10, below=0.7cm of fis] (ana) {\texttt{analysis}};
+\node[below=0.08cm of ana, detail] {JSD · MI matrix · FFT · DWT · Laplacian · DS · BPA};
 
-\draw[arr] (enc) -- node[right, font=\scriptsize]{JSON collections} (fis);
-\draw[arr] (fis) -- node[right, font=\scriptsize]{calls} (ana);
+\draw[arr] (enc.south) -- node[right, detail]{JSON collections} (fis.north);
+\draw[arr] (fis.south) -- node[right, detail]{math calls} (ana.north);
+
+\node[detail, left=0.2cm of enc, align=right] {raw logs $\rightarrow$};
+\node[detail, right=0.2cm of fis, align=left] {$\leftarrow$ AnomalyReport};
 
 \end{tikzpicture}
-\caption{Three-crate workspace. \texttt{analysis} is domain-agnostic (no \texttt{LogCollection} imports). \texttt{fishy} orchestrates the fusion pipeline. \texttt{encoder} tokenizes raw logs into the collection format.}
+\caption{Three-crate workspace. \texttt{analysis} is domain-agnostic and never imports \texttt{fishy} types. \texttt{fishy} orchestrates the fusion pipeline. \texttt{encoder} tokenizes raw logs into the collection format consumed by \texttt{fishy}.}
 \label{fig:arch}
 \end{figure}
 
